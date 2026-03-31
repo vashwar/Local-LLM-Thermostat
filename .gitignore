@@ -1,0 +1,55 @@
+# API Keys and Tokens
+apikey.txt
+nest_tokens.json
+config.yaml
+.env
+.env.local
+
+# Database
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Local Claude settings
+.claude/
+
+# Logs
+*.log
+
+# Local development
+temp/
+tmp/
+test_output/
