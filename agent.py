@@ -213,13 +213,20 @@ def build_context(thermo_state, weather_data, all_states=None) -> str:
 
 
 def _get_message_age_minutes(msg: dict, now: datetime) -> Optional[float]:
-    """Get the age of a message in minutes, or None if timestamp is missing."""
+    """Get the age of a message in minutes, or None if timestamp is missing.
+    Note: SQLite stores timestamps as UTC via datetime('now'), and `now` is
+    local time from datetime.now(). We convert the UTC timestamp to local time
+    before comparing.
+    """
     ts = msg.get("timestamp", "")
     if not ts:
         return None
     try:
-        msg_time = datetime.fromisoformat(ts.replace("Z", "+00:00").replace("+00:00", ""))
-        return (now - msg_time).total_seconds() / 60
+        # SQLite datetime('now') returns UTC. Parse as UTC, convert to local.
+        from datetime import timezone
+        msg_time_utc = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+        msg_time_local = msg_time_utc.astimezone().replace(tzinfo=None)
+        return (now - msg_time_local).total_seconds() / 60
     except (ValueError, TypeError):
         return None
 
@@ -270,7 +277,7 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
     Python pre-processor: analyze the situation and produce a clear, concise
     directive for the LLM. This is where the intelligence lives.
     """
-    mode = thermo_state.mode  # COOL or HEAT
+    mode = thermo_state.mode  # "cooling", "heating", "auto", "off"
     indoor = thermo_state.indoor_temp
     outdoor = weather_data.current_temp
     target = thermo_state.target_temp
@@ -278,7 +285,7 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
     user_request_hours = comfort.get("user_request_hours", 2)
 
     # Comfort ranges
-    if mode == "HEAT":
+    if mode == "heating":
         comfort_low, comfort_high = comfort.get("winter_range", [68, 72])
     else:
         comfort_low, comfort_high = comfort.get("summer_range", [75, 80])
@@ -298,7 +305,7 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
 
     # ── Sleep time logic (handled in Python, not by LLM) ──
     if period == "sleep":
-        if mode == "COOL":
+        if mode == "cooling":
             sleep_cool = comfort.get("sleep_cool_temp", 75)
             override_temp = comfort.get("sleep_cool_override_temp", 80)
             if indoor <= sleep_cool + 1:
@@ -314,13 +321,13 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
                 parts.append(f"Sleep time, winter. Indoor {indoor}F is getting cold. Heat to {comfort_low}F.")
 
     elif period == "pre_wake":
-        if mode == "HEAT":
+        if mode == "heating":
             parts.append(f"Early morning, {comfort.get('pre_heat_minutes', 30)} min before wake. Pre-heat to {comfort_high}F so the house is warm.")
         else:
             parts.append(f"Early morning before wake. Check if comfortable, adjust if needed.")
 
     elif period == "winding_down":
-        if mode == "COOL":
+        if mode == "cooling":
             sleep_cool = comfort.get("sleep_cool_temp", 75)
             parts.append(f"Approaching bedtime. Pre-cool to {sleep_cool}F for a comfortable night.")
         else:
@@ -343,9 +350,9 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
     # ── Forecast analysis (Python-parsed, time-aware) ──
     forecast = weather.get_forecast_analysis()
     if forecast:
-        if forecast.pre_cool_now and mode == "COOL":
+        if forecast.pre_cool_now and mode == "cooling":
             parts.append(f"URGENT: {forecast.advisory} Pre-cool to {comfort_low}F now.")
-        elif forecast.pre_heat_now and mode == "HEAT":
+        elif forecast.pre_heat_now and mode == "heating":
             parts.append(f"URGENT: {forecast.advisory} Pre-heat to {comfort_high}F now.")
         elif forecast.advisory:
             parts.append(f"Forecast: {forecast.advisory}")
