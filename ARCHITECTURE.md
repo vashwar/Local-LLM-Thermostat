@@ -476,6 +476,8 @@ Both run concurrently via asyncio.gather()
 
 ```yaml
 llm:
+  server_exe: "C:\\path\\to\\llama-server.exe"         # Full path to llama-server executable
+  model_path: "C:\\path\\to\\Qwen3-4B-Instruct.gguf"   # Full path to model GGUF file
   endpoint: "http://localhost:8080/v1/chat/completions"
   model: "qwen4b"
   temperature: 0.3        # Low = more deterministic

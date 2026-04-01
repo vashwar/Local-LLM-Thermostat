@@ -50,13 +50,9 @@ Single Evaluation Cycle:
 ### Step 1: Install llama.cpp
 
 1. Download a prebuilt release from [llama.cpp releases](https://github.com/ggerganov/llama.cpp/releases) (pick the CUDA version matching your GPU)
-2. Extract `llama-server.exe` to a folder, e.g. `C:\VashwarTests\EmailOrganizer\llama-server\`
-3. Download the Qwen 4B GGUF model from [HuggingFace](https://huggingface.co/Qwen) and place it in a `models\` folder, e.g. `C:\VashwarTests\EmailOrganizer\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf`
-4. Update the paths in `llm_server.py` if your locations differ:
-   ```python
-   _server_exe = r"C:\path\to\llama-server.exe"
-   _model_path = r"C:\path\to\model.gguf"
-   ```
+2. Extract `llama-server.exe` to a folder on your system (e.g., `C:\llama-cpp\llama-server.exe`)
+3. Download the Qwen 4B GGUF model from [HuggingFace](https://huggingface.co/Qwen) and save it somewhere (e.g., `C:\models\Qwen3-4B-Instruct-Q4_K_M.gguf`)
+4. Note the full paths to both files — you'll add them to `config.yaml` in Step 5
 
 ### Step 2: Get Nest API Access
 
@@ -152,6 +148,8 @@ Edit `config.yaml` with your values:
 
 ```yaml
 llm:
+  server_exe: "C:\\path\\to\\llama-server.exe"         # Full path to llama-server executable
+  model_path: "C:\\path\\to\\model.gguf"               # Full path to Qwen 4B GGUF model
   endpoint: "http://localhost:8080/v1/chat/completions"
   model: "qwen4b"
   temperature: 0.3

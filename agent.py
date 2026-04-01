@@ -756,8 +756,13 @@ async def main():
                        devices=config["nest"].get("devices"))
 
     # Init LLM server manager (doesn't start the server yet)
-    llm_port = int(config["llm"]["endpoint"].split(":")[-1].split("/")[0])
-    llm_server.init(port=llm_port)
+    llm_cfg = config["llm"]
+    llm_port = int(llm_cfg["endpoint"].split(":")[-1].split("/")[0])
+    llm_server.init(
+        server_exe=llm_cfg["server_exe"],
+        model_path=llm_cfg["model_path"],
+        port=llm_port
+    )
 
     # Init Telegram bot (imported here to avoid circular imports)
     import telegram_bot

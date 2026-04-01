@@ -14,17 +14,21 @@ import signal
 logger = logging.getLogger(__name__)
 
 _process = None
-_server_exe = r"C:\VashwarTests\EmailOrganizer\llama-server\llama-server.exe"
-_model_path = r"C:\VashwarTests\EmailOrganizer\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+_server_exe = None
+_model_path = None
 _port = 8080
 _health_url = None
 
 
-def init(port: int = 8080):
-    """Initialize with the configured port."""
-    global _port, _health_url
+def init(server_exe: str, model_path: str, port: int = 8080):
+    """Initialize with server executable path, model path, and port."""
+    global _port, _health_url, _server_exe, _model_path
+    _server_exe = server_exe
+    _model_path = model_path
     _port = port
     _health_url = f"http://localhost:{_port}/health"
+    logger.info("LLM server configured: exe=%s, model=%s, port=%d",
+                _server_exe, _model_path, _port)
 
 
 def is_running() -> bool:
