@@ -253,7 +253,7 @@ def count_temp_changes_last_hour() -> int:
     """Count temperature changes in the last hour (for rate limiting)."""
     conn = _get_conn()
     try:
-        cutoff = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        cutoff = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
         row = conn.execute("""
             SELECT COUNT(*) as cnt FROM decisions
             WHERE action = 'set_temperature' AND timestamp > ?
@@ -285,7 +285,7 @@ def get_climate_log_since(since: datetime) -> list:
         rows = conn.execute("""
             SELECT * FROM climate_log WHERE timestamp > ?
             ORDER BY timestamp ASC
-        """, (since.isoformat(),)).fetchall()
+        """, (since.strftime("%Y-%m-%d %H:%M:%S"),)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -332,7 +332,7 @@ def get_heartbeat() -> Optional[str]:
 
 def cleanup_old_records(retention_days: int = 90):
     """Delete records older than retention_days from 90-day tables."""
-    cutoff = (datetime.utcnow() - timedelta(days=retention_days)).isoformat()
+    cutoff = (datetime.utcnow() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
     conn = _get_conn()
     try:
         for table in ["decisions", "messages", "errors", "manual_overrides"]:
