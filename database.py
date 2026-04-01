@@ -241,7 +241,7 @@ def get_recent_decisions(limit: int = 10) -> list:
     conn = _get_conn()
     try:
         rows = conn.execute("""
-            SELECT timestamp, indoor_temp, outdoor_temp, action, temperature, reasoning
+            SELECT timestamp, zone, indoor_temp, outdoor_temp, action, temperature, reasoning
             FROM decisions ORDER BY timestamp DESC LIMIT ?
         """, (limit,)).fetchall()
         return [dict(r) for r in reversed(rows)]
