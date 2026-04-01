@@ -225,19 +225,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_agent_message(message: str):
-    """Send an outbound message to all whitelisted chats (alerts, reports)."""
+    """Send an outbound message to all whitelisted chats (alerts, reports).
+    Splits messages longer than 4096 chars (Telegram API limit).
+    """
     if not _app or not _app.bot:
         logger.warning("Cannot send message — bot not initialized (app=%s)", _app)
         return
 
-    logger.info("Sending to %d chat(s): %s", len(_whitelisted_ids), message[:60])
+    # Split into chunks at newlines, respecting Telegram's 4096-char limit
+    MAX_LEN = 4096
+    chunks = []
+    if len(message) <= MAX_LEN:
+        chunks = [message]
+    else:
+        current = ""
+        for line in message.split("\n"):
+            if len(current) + len(line) + 1 > MAX_LEN:
+                if current:
+                    chunks.append(current)
+                current = line
+            else:
+                current = f"{current}\n{line}" if current else line
+        if current:
+            chunks.append(current)
+
+    logger.info("Sending to %d chat(s) (%d chunk(s)): %s",
+                len(_whitelisted_ids), len(chunks), message[:60])
     for chat_id in _whitelisted_ids:
         if chat_id == 0:
             continue  # Skip placeholder
-        try:
-            await _app.bot.send_message(chat_id=chat_id, text=message)
-        except Exception as e:
-            logger.error("Failed to send to %s: %s", chat_id, e)
+        for chunk in chunks:
+            try:
+                await _app.bot.send_message(chat_id=chat_id, text=chunk)
+            except Exception as e:
+                logger.error("Failed to send to %s: %s", chat_id, e)
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):

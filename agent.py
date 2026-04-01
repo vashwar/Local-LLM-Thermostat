@@ -630,7 +630,7 @@ async def run_evaluation_cycle() -> Optional[dict]:
         if temp_changes:
             parts = []
             for d in temp_changes:
-                reason = d.get("reasoning", "")[:60]
+                reason = d.get("reasoning", "")[:200]
                 parts.append(f"{d['zone']}: set to {d['temperature']:.0f}F — {reason}")
             await send_telegram("\n".join(parts))
 
