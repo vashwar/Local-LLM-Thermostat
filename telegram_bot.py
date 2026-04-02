@@ -21,17 +21,34 @@ logger = logging.getLogger(__name__)
 
 
 async def _safe_reply(message, text: str, retries: int = 1):
-    """Send a reply with retry on timeout."""
-    for attempt in range(retries + 1):
-        try:
-            await message.reply_text(text)
-            return
-        except (TimedOut, NetworkError) as e:
-            if attempt < retries:
-                logger.warning("Telegram reply timed out, retrying...")
-                await asyncio.sleep(2)
+    """Send a reply with retry on timeout. Splits long messages at 4096 chars."""
+    MAX_LEN = 4096
+    if len(text) <= MAX_LEN:
+        chunks = [text]
+    else:
+        chunks = []
+        current = ""
+        for line in text.split("\n"):
+            if len(current) + len(line) + 1 > MAX_LEN:
+                if current:
+                    chunks.append(current)
+                current = line
             else:
-                logger.error("Telegram reply failed after %d attempts: %s", retries + 1, e)
+                current = f"{current}\n{line}" if current else line
+        if current:
+            chunks.append(current)
+
+    for chunk in chunks:
+        for attempt in range(retries + 1):
+            try:
+                await message.reply_text(chunk)
+                break
+            except (TimedOut, NetworkError) as e:
+                if attempt < retries:
+                    logger.warning("Telegram reply timed out, retrying...")
+                    await asyncio.sleep(2)
+                else:
+                    logger.error("Telegram reply failed after %d attempts: %s", retries + 1, e)
 
 _app: Application = None
 _config: dict = {}
@@ -120,7 +137,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"{ts} [{zone}] set to {d['temperature']:.0f}F")
             else:
                 lines.append(f"{ts} [{zone}] unchanged")
-            lines.append(f"  {(d.get('reasoning') or '')[:60]}")
+            lines.append(f"  {(d.get('reasoning') or '')[:200]}")
 
         await _safe_reply(update.message,"\n".join(lines))
 
