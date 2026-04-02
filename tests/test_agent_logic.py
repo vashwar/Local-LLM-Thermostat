@@ -22,7 +22,9 @@ from nest_api import ThermostatState
 
 @pytest.fixture(autouse=True)
 def setup_config():
-    """Load a minimal config for all tests."""
+    """Load a minimal config and reset module state for all tests."""
+    agent._evaluation_counter = 0
+    agent._user_message_eval_counter = None
     agent._config = {
         "llm": {
             "model": "test",
@@ -442,8 +444,14 @@ class TestDirective:
         utc_now = datetime.now(timezone.utc)
         return (utc_now - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
 
+    def _activate_user_message(self, cycles_ago=0):
+        """Simulate a user message that arrived cycles_ago eval cycles back."""
+        agent._evaluation_counter = 10
+        agent._user_message_eval_counter = 10 - cycles_ago
+
     def test_user_message_has_zone_routing(self):
         """When user message exists, directive includes zone routing."""
+        self._activate_user_message(cycles_ago=0)
         state = _make_thermo_state(name="Upstairs", mode="cooling", indoor_temp=76.0)
         now = datetime(2025, 7, 15, 14, 0)
         comfort = agent._config["comfort"]
@@ -459,6 +467,7 @@ class TestDirective:
 
     def test_user_message_has_both_all_handling(self):
         """Directive includes guidance for 'both'/'all' keywords."""
+        self._activate_user_message(cycles_ago=0)
         state = _make_thermo_state(name="Downstairs", mode="cooling", indoor_temp=76.0)
         now = datetime(2025, 7, 15, 14, 0)
         comfort = agent._config["comfort"]
@@ -471,6 +480,39 @@ class TestDirective:
                                                now, comfort, sched, messages)
 
         assert "'both', 'all', 'everything', or 'whole house'" in directive
+
+    def test_user_message_active_on_second_cycle(self):
+        """User message is still honored on the cycle after it arrived."""
+        self._activate_user_message(cycles_ago=1)
+        state = _make_thermo_state(name="Upstairs", mode="cooling", indoor_temp=76.0)
+        now = datetime(2025, 7, 15, 14, 0)
+        comfort = agent._config["comfort"]
+        sched = agent._config["schedule"]
+        messages = [{"text": "set to 75", "timestamp": self._ts_minutes_ago(5)}]
+
+        with patch("agent.weather") as mock_weather:
+            mock_weather.get_forecast_analysis.return_value = None
+            directive = agent._build_directive(state, MagicMock(current_temp=95.0),
+                                               now, comfort, sched, messages)
+
+        assert "PRIORITY" in directive
+
+    def test_user_message_expired_after_two_cycles(self):
+        """User message is disregarded after 2 evaluation cycles."""
+        self._activate_user_message(cycles_ago=2)
+        state = _make_thermo_state(mode="cooling", indoor_temp=76.0)
+        now = datetime(2025, 7, 15, 14, 0)
+        comfort = agent._config["comfort"]
+        sched = agent._config["schedule"]
+        messages = [{"text": "set to 75", "timestamp": self._ts_minutes_ago(5)}]
+
+        with patch("agent.weather") as mock_weather:
+            mock_weather.get_forecast_analysis.return_value = None
+            directive = agent._build_directive(state, MagicMock(current_temp=95.0),
+                                               now, comfort, sched, messages)
+
+        assert "PRIORITY" not in directive
+        assert "Prefer no_change to save energy" in directive
 
     def test_no_message_has_energy_saving(self):
         """When no user message, directive includes energy-saving preference."""

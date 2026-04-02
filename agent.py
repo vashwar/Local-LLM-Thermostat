@@ -52,6 +52,8 @@ _config: dict = {}
 _last_evaluation_result: Optional[dict] = None
 _evaluation_counter: int = 0  # Incremented each completed cycle
 _user_triggered: bool = False  # True when evaluation was triggered by a user message
+_user_message_eval_counter: Optional[int] = None  # Counter when last user message arrived
+USER_MESSAGE_MAX_CYCLES = 2  # Disregard user message after this many eval cycles
 _telegram_send_fn = None  # Set by telegram_bot on startup
 
 
@@ -279,8 +281,12 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
 
     parts = [f"Comfort range: {comfort_low}-{comfort_high}F (guide only -- explicit user requests override this)."]
 
-    # ── Path A: User message exists → LLM parses with zone-aware prompt ──
-    recent_msg = _find_recent_user_message(messages, now, user_request_hours)
+    # ── Path A: User message exists and within cycle limit → LLM parses ──
+    user_msg_active = (
+        _user_message_eval_counter is not None
+        and _evaluation_counter - _user_message_eval_counter < USER_MESSAGE_MAX_CYCLES
+    )
+    recent_msg = _find_recent_user_message(messages, now, user_request_hours) if user_msg_active else None
     if recent_msg:
         zone_name = thermo_state.name
         parts.append(
@@ -630,9 +636,10 @@ async def run_evaluation_cycle() -> Optional[dict]:
 
 def trigger_evaluation():
     """Called by Telegram bot to wake the agent loop for an immediate evaluation."""
-    global _user_triggered
+    global _user_triggered, _user_message_eval_counter
     _user_triggered = True
-    logger.info("Evaluation triggered by user message")
+    _user_message_eval_counter = _evaluation_counter
+    logger.info("Evaluation triggered by user message (counter=%d)", _evaluation_counter)
 
 
 async def agent_loop():
