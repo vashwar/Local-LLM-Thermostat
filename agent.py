@@ -7,7 +7,6 @@ Autonomous climate control using a local LLM (Qwen 4B via llama.cpp).
 import asyncio
 import json
 import logging
-import re
 import sys
 import time
 import requests
@@ -160,8 +159,6 @@ def validate_response(response_text: str) -> Tuple[bool, Optional[str]]:
         if data["action"] == "set_temperature":
             if "temperature" not in data or data["temperature"] is None:
                 return False, "set_temperature action missing temperature"
-            if not (TEMP_MIN <= data["temperature"] <= TEMP_MAX):
-                return False, f"Temperature {data['temperature']} out of range ({TEMP_MIN}-{TEMP_MAX})"
 
         if data["action"] == "no_change":
             if "temperature" in data and data["temperature"] is not None:
@@ -231,24 +228,20 @@ def _get_message_age_minutes(msg: dict, now: datetime) -> Optional[float]:
         return None
 
 
-def _find_recent_user_request(messages: list, now: datetime, max_hours: float) -> Optional[str]:
-    """
-    Find the most recent user message that looks like a temperature request.
-    Returns the message text if it's within max_hours, else None.
-    """
-    temp_pattern = re.compile(r'(?:set|change|make|turn|put|adjust).*\d+', re.IGNORECASE)
+def _find_recent_user_message(messages: list, now: datetime, max_hours: float) -> Optional[str]:
+    """Find the most recent user message within max_hours. No filtering — LLM parses intent."""
     for msg in reversed(messages):
         text = msg.get("text", "")
         if not text:
             continue
         age = _get_message_age_minutes(msg, now)
-        if age is not None and age <= max_hours * 60 and temp_pattern.search(text):
+        if age is not None and age <= max_hours * 60:
             return text
     return None
 
 
 def _get_time_period(now: datetime, sched: dict) -> str:
-    """Determine the current time period: sleep, pre_wake, waking_up, work, winding_down, home."""
+    """Determine the current time period: sleep, winding_down, or awake."""
     sleep_time = sched.get("sleep_time", "23:00")
     wake_time = sched.get("wake_time", "07:00")
     sleep_h, sleep_m = map(int, sleep_time.split(":"))
@@ -257,30 +250,24 @@ def _get_time_period(now: datetime, sched: dict) -> str:
     cur = now.hour * 60 + now.minute
     sleep_min = sleep_h * 60 + sleep_m
     wake_min = wake_h * 60 + wake_m
-    pre_heat = _config.get("comfort", {}).get("pre_heat_minutes", 30)
 
-    if cur >= sleep_min or cur < wake_min - pre_heat:
+    if cur >= sleep_min or cur < wake_min:
         return "sleep"
-    if wake_min - pre_heat <= cur < wake_min:
-        return "pre_wake"
-    if wake_min <= cur < wake_min + 60:
-        return "waking_up"
-    if 9 * 60 <= cur <= 17 * 60 and now.weekday() < 5:
-        return "work"
     if cur >= sleep_min - 60:
         return "winding_down"
-    return "home"
+    return "awake"
 
 
 def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) -> str:
     """
     Python pre-processor: analyze the situation and produce a clear, concise
-    directive for the LLM. This is where the intelligence lives.
+    directive for the LLM. Two paths:
+      A) User message exists → LLM parses intent with zone-aware prompt
+      B) No user message → Python provides context, energy-saving bias
     """
     mode = thermo_state.mode  # "cooling", "heating", "auto", "off"
     indoor = thermo_state.indoor_temp
     outdoor = weather_data.current_temp
-    target = thermo_state.target_temp
     period = _get_time_period(now, sched)
     user_request_hours = comfort.get("user_request_hours", 2)
 
@@ -290,20 +277,24 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
     else:
         comfort_low, comfort_high = comfort.get("summer_range", [75, 80])
 
-    parts = [f"Comfort range: {comfort_low}-{comfort_high}F."]
+    parts = [f"Comfort range: {comfort_low}-{comfort_high}F (guide only -- explicit user requests override this)."]
 
-    # ── Check for recent user request (highest priority) ──
-    recent_request = _find_recent_user_request(messages, now, user_request_hours)
-    if recent_request:
-        parts.append(f"PRIORITY: User recently said: '{recent_request}'. Follow this request exactly.")
+    # ── Path A: User message exists → LLM parses with zone-aware prompt ──
+    recent_msg = _find_recent_user_message(messages, now, user_request_hours)
+    if recent_msg:
+        zone_name = thermo_state.name
+        parts.append(
+            f"PRIORITY: User recently said: '{recent_msg}'. "
+            f"Apply ONLY the part relevant to YOUR zone ({zone_name}). "
+            f"If the user says 'both', 'all', 'everything', or 'whole house', "
+            f"this DOES apply to your zone -- set the requested temperature. "
+            f"If nothing applies to your zone, ignore and use normal logic."
+        )
         return "DIRECTIVE: " + " ".join(parts)
 
-    # Check for expired user request
-    expired_request = _find_recent_user_request(messages, now, 24)  # Look back 24h
-    if expired_request and not recent_request:
-        parts.append(f"User previously said '{expired_request}' but that was over {user_request_hours}h ago. Re-evaluate freely.")
+    # ── Path B: No user message → Python provides context, energy-saving bias ──
 
-    # ── Sleep time logic (handled in Python, not by LLM) ──
+    # Sleep time logic (proven, keep as-is)
     if period == "sleep":
         if mode == "cooling":
             sleep_cool = comfort.get("sleep_cool_temp", 75)
@@ -314,38 +305,26 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
                 parts.append(f"Sleep time, summer. Outdoor is hot ({outdoor}F). Indoor {indoor}F is warm. Cool to {sleep_cool}F.")
             else:
                 parts.append(f"Sleep time, summer. Outdoor is mild ({outdoor}F). Let the house coast — prefer no_change.")
-        else:  # HEAT
+        else:  # heating
             if indoor >= TEMP_MIN + 2:
                 parts.append(f"Sleep time, winter. Indoor {indoor}F is fine. Let it drift — prefer no_change.")
             else:
                 parts.append(f"Sleep time, winter. Indoor {indoor}F is getting cold. Heat to {comfort_low}F.")
 
-    elif period == "pre_wake":
-        if mode == "heating":
-            parts.append(f"Early morning, {comfort.get('pre_heat_minutes', 30)} min before wake. Pre-heat to {comfort_high}F so the house is warm.")
-        else:
-            parts.append(f"Early morning before wake. Check if comfortable, adjust if needed.")
-
     elif period == "winding_down":
+        # Pre-cool before bed, but ONLY on hot days when indoor is warm
         if mode == "cooling":
             sleep_cool = comfort.get("sleep_cool_temp", 75)
-            parts.append(f"Approaching bedtime. Pre-cool to {sleep_cool}F for a comfortable night.")
+            if outdoor > comfort_high and indoor >= comfort_high - 1:
+                parts.append(f"Hot day, bedtime approaching. Indoor {indoor}F is warm. Pre-cool to {sleep_cool}F.")
+            else:
+                parts.append(f"Approaching bedtime. Indoor {indoor}F is comfortable. Prefer no_change.")
         else:
             parts.append(f"Approaching bedtime. Let the temp settle toward {comfort_low}F.")
 
-    elif period == "work":
-        parts.append(f"Work hours, user may be away. Wider range OK to save energy.")
-
-    elif period == "waking_up":
-        parts.append(f"Just woke up. Target {comfort_high}F for comfort.")
-
-    else:  # home
-        if indoor < comfort_low:
-            parts.append(f"Indoor {indoor}F is below comfort range. Adjust to {comfort_low}F.")
-        elif indoor > comfort_high:
-            parts.append(f"Indoor {indoor}F is above comfort range. Adjust to {comfort_high}F.")
-        else:
-            parts.append(f"Indoor {indoor}F is within comfort range. No change likely needed.")
+    else:
+        # Default for ALL other periods — prefer energy saving
+        parts.append(f"Prefer no_change to save energy unless indoor temp is outside comfort range.")
 
     # ── Forecast analysis (Python-parsed, time-aware) ──
     forecast = weather.get_forecast_analysis()
@@ -368,7 +347,6 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
         last_text = messages[-1].get("text", "")
         last_age = _get_message_age_minutes(messages[-1], now)
         if last_age is not None and last_age < 30:
-            # Check if it's a question (not a command)
             if "?" in last_text or any(w in last_text.lower() for w in ["what", "how", "when", "is it", "will it"]):
                 parts.append(f"User asked: '{last_text}'. Answer in message_to_user. Use no_change.")
 
@@ -411,9 +389,12 @@ def check_guardrails(decision: dict, user_triggered: bool = False) -> Tuple[bool
 
     temp = decision.get("temperature")
 
-    # Temperature bounds
+    # Temperature bounds — clamp instead of block
     if temp is not None and not (TEMP_MIN <= temp <= TEMP_MAX):
-        return False, f"Temperature {temp} outside bounds ({TEMP_MIN}-{TEMP_MAX})"
+        clamped = max(TEMP_MIN, min(TEMP_MAX, temp))
+        logger.warning("Guardrail clamp: LLM requested %sF, clamped to %sF", temp, clamped)
+        decision["temperature"] = clamped
+        decision["reasoning"] = f"[Clamped {temp}F->{clamped}F] " + decision.get("reasoning", "")
 
     # Rate limit (skipped for user-triggered evaluations)
     if not user_triggered:
