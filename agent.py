@@ -115,6 +115,13 @@ def call_llm(system_prompt: str) -> Tuple[Optional[str], bool]:
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"].strip()
 
+            # Strip markdown code fences (e.g. ```json ... ```)
+            if content.startswith("```"):
+                lines = content.split("\n")
+                # Remove first line (```json) and last line (```)
+                lines = [l for l in lines if not l.strip().startswith("```")]
+                content = "\n".join(lines).strip()
+
             # Try to parse as JSON
             try:
                 json.loads(content)
@@ -287,16 +294,32 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
         and _evaluation_counter - _user_message_eval_counter < USER_MESSAGE_MAX_CYCLES
     )
     recent_msg = _find_recent_user_message(messages, now, user_request_hours) if user_msg_active else None
+    
     if recent_msg:
         zone_name = thermo_state.name
-        parts.append(
-            f"PRIORITY: User recently said: '{recent_msg}'. "
-            f"Apply ONLY the part relevant to YOUR zone ({zone_name}). "
-            f"If the user says 'both', 'all', 'everything', or 'whole house', "
-            f"this DOES apply to your zone -- set the requested temperature. "
-            f"If nothing applies to your zone, ignore and use normal logic."
-        )
-        return "DIRECTIVE: " + " ".join(parts)
+        
+        # 1. Map Semantic Aliases dynamically based on the current zone
+        if "Upstairs" in zone_name:
+            zone_aliases = "upstairs, bed, bedroom"
+            other_name = "Downstairs Kitchen"
+            other_aliases = "downstairs, kitchen"
+        else:
+            zone_aliases = "downstairs, kitchen"
+            other_name = "Upstairs Bedroom"
+            other_aliases = "upstairs, bed, bedroom"
+            
+        # 2. Overwrite the prompt array with the Ultra-Lean 4-Rule logic
+        parts = [
+            f"Determine the target temperature for YOUR zone.\n",
+            f"YOUR ZONE: {zone_name} (Aliases: {zone_aliases})\n",
+            f"OTHER ZONE: {other_name} (Aliases: {other_aliases})\n",
+            f"RULE 1: The user said: '{recent_msg}'\n",
+            f"RULE 2: If the message targets YOUR ZONE or its aliases, output the requested temperature.\n",
+            f"RULE 3: If the message says 'both', 'all', 'house', or 'everything', output the requested temperature.\n",
+            f"RULE 4: If the message ONLY targets the OTHER ZONE or its aliases, you MUST output \"action\": \"no_change\"."
+        ]
+        return "DIRECTIVE:\n" + "".join(parts)
+
 
     # ── Path B: No user message → Python provides context, energy-saving bias ──
 

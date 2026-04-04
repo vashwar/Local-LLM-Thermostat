@@ -450,7 +450,7 @@ class TestDirective:
         agent._user_message_eval_counter = 10 - cycles_ago
 
     def test_user_message_has_zone_routing(self):
-        """When user message exists, directive includes zone routing."""
+        """When user message exists, directive includes zone identification."""
         self._activate_user_message(cycles_ago=0)
         state = _make_thermo_state(name="Upstairs", mode="cooling", indoor_temp=76.0)
         now = datetime(2025, 7, 15, 14, 0)
@@ -463,7 +463,8 @@ class TestDirective:
             directive = agent._build_directive(state, MagicMock(current_temp=95.0),
                                                now, comfort, sched, messages)
 
-        assert "Apply ONLY the part relevant to YOUR zone (Upstairs)" in directive
+        assert "YOUR ZONE: Upstairs" in directive
+        assert "OTHER ZONE:" in directive
 
     def test_user_message_has_both_all_handling(self):
         """Directive includes guidance for 'both'/'all' keywords."""
@@ -479,7 +480,7 @@ class TestDirective:
             directive = agent._build_directive(state, MagicMock(current_temp=95.0),
                                                now, comfort, sched, messages)
 
-        assert "'both', 'all', 'everything', or 'whole house'" in directive
+        assert "'both'" in directive and "'all'" in directive
 
     def test_user_message_active_on_second_cycle(self):
         """User message is still honored on the cycle after it arrived."""
@@ -495,7 +496,8 @@ class TestDirective:
             directive = agent._build_directive(state, MagicMock(current_temp=95.0),
                                                now, comfort, sched, messages)
 
-        assert "PRIORITY" in directive
+        assert "RULE 1:" in directive
+        assert "set to 75" in directive
 
     def test_user_message_expired_after_two_cycles(self):
         """User message is disregarded after 2 evaluation cycles."""

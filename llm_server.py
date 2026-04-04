@@ -61,6 +61,7 @@ def start() -> bool:
             "--port", str(_port),
             "-c", "4096",
             "-ngl", "99",
+            "--reasoning", "off",
             "--log-disable"
         ],
         stdout=subprocess.DEVNULL,
