@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Project Status
+
+- **Weather module**: Switched to Open-Meteo primary (free, no key, true daily high/low), OWM fallback
+- **All tests passing**: 46/46 unit tests in `tests/test_agent_logic.py`
+- **Do NOT push**: `testHarness/` folder (added to `.gitignore`)
+
 ## gstack
 
 - For all web browsing, always use the `/browse` skill from gstack. Never use `mcp__claude-in-chrome__*` tools.
