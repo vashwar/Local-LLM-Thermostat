@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 Weather module for the AI Thermostat Agent.
-Uses OpenWeatherMap free tier (current + 5-day forecast).
+Primary: Open-Meteo (free, no API key, true daily high/low, hourly resolution).
+Fallback: OpenWeatherMap free tier (3-hour intervals).
 20-minute cache with stale detection at 6 hours.
 """
 
 import logging
 import time
 import requests
-from typing import Optional, Tuple
+from typing import Optional
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -19,9 +20,41 @@ _lon: Optional[float] = None
 _cache_minutes: int = 20
 _stale_hours: int = 6
 
-# Cache
+# Cache (stores normalized format from either source)
 _cached_weather: Optional[dict] = None
 _cache_timestamp: float = 0
+
+# WMO weather code → condition string (matches OWM condition names)
+_WMO_TO_CONDITION = {
+    0: "Clear",
+    1: "Clear",         # Mainly clear
+    2: "Clouds",        # Partly cloudy
+    3: "Clouds",        # Overcast
+    45: "Mist",         # Fog
+    48: "Mist",         # Depositing rime fog
+    51: "Drizzle",
+    53: "Drizzle",
+    55: "Drizzle",
+    56: "Drizzle",      # Freezing drizzle
+    57: "Drizzle",      # Freezing drizzle heavy
+    61: "Rain",
+    63: "Rain",
+    65: "Rain",         # Heavy rain
+    66: "Rain",         # Freezing rain
+    67: "Rain",         # Heavy freezing rain
+    71: "Snow",
+    73: "Snow",
+    75: "Snow",
+    77: "Snow",         # Snow grains
+    80: "Rain",         # Rain showers slight
+    81: "Rain",         # Rain showers moderate
+    82: "Rain",         # Rain showers violent
+    85: "Snow",         # Snow showers slight
+    86: "Snow",         # Snow showers heavy
+    95: "Thunderstorm",
+    96: "Thunderstorm", # Thunderstorm with slight hail
+    99: "Thunderstorm", # Thunderstorm with heavy hail
+}
 
 
 @dataclass
@@ -48,6 +81,7 @@ def init_weather(api_key: str, latitude: float, longitude: float,
 def get_weather() -> WeatherData:
     """
     Get current weather and forecast.
+    Primary: Open-Meteo. Fallback: OpenWeatherMap.
     Returns cached data if within cache window.
     Marks data [STALE] if cache > stale_hours.
     """
@@ -62,28 +96,39 @@ def get_weather() -> WeatherData:
     if _cached_weather and cache_age_minutes < _cache_minutes:
         return _build_weather_data(_cached_weather, is_stale=False)
 
-    # Try to fetch fresh data
+    # Try Open-Meteo first
     try:
-        current = _fetch_current()
-        forecast = _fetch_forecast()
-        _cached_weather = {"current": current, "forecast": forecast}
+        normalized = _fetch_open_meteo()
+        _cached_weather = normalized
         _cache_timestamp = now
+        logger.info("Weather fetched from Open-Meteo")
         return _build_weather_data(_cached_weather, is_stale=False)
     except Exception as e:
-        logger.error("Weather fetch failed: %s", e)
-        # Return stale cache if we have one
-        if _cached_weather:
-            is_stale = cache_age_hours > _stale_hours
-            return _build_weather_data(_cached_weather, is_stale=is_stale,
-                                       stale_hours=cache_age_hours)
-        # No cache at all — return defaults
-        return WeatherData(
-            current_temp=75.0,
-            humidity=50,
-            forecast_summary="[STALE - weather data unavailable]",
-            is_stale=True,
-            alerts=[]
-        )
+        logger.warning("Open-Meteo fetch failed: %s — trying OWM fallback", e)
+
+    # Fallback: OpenWeatherMap
+    try:
+        normalized = _fetch_owm_normalized()
+        _cached_weather = normalized
+        _cache_timestamp = now
+        logger.info("Weather fetched from OpenWeatherMap (fallback)")
+        return _build_weather_data(_cached_weather, is_stale=False)
+    except Exception as e:
+        logger.error("OWM fallback also failed: %s", e)
+
+    # Return stale cache if we have one
+    if _cached_weather:
+        is_stale = cache_age_hours > _stale_hours
+        return _build_weather_data(_cached_weather, is_stale=is_stale,
+                                   stale_hours=cache_age_hours)
+    # No cache at all — return defaults
+    return WeatherData(
+        current_temp=75.0,
+        humidity=50,
+        forecast_summary="[STALE - weather data unavailable]",
+        is_stale=True,
+        alerts=[]
+    )
 
 
 def check_weather_alerts(weather: WeatherData) -> list:
@@ -118,26 +163,34 @@ class ForecastAnalysis:
 def get_forecast_analysis() -> Optional[ForecastAnalysis]:
     """
     Analyze the cached forecast data and return structured insights.
-    Time-aware: calculates WHEN peak temps arrive and only advises
-    pre-cooling/heating 1-2 hours before the event.
+    Time-aware: uses actual timestamps to slice windows and find peaks.
+    Works with both hourly (Open-Meteo) and 3-hour (OWM) resolution.
     Returns None if no forecast data is available.
     """
-    if not _cached_weather or "forecast" not in _cached_weather:
+    if not _cached_weather or "hourly" not in _cached_weather:
         return None
 
-    entries = _cached_weather["forecast"].get("list", [])
+    entries = _cached_weather["hourly"]
     if not entries:
         return None
 
     now = time.time()
 
-    # Next 6 hours (2 entries), 12 hours (4), 24 hours (8)
-    next_6h = entries[:2] if len(entries) >= 2 else entries
-    next_12h = entries[:4] if len(entries) >= 4 else entries
-    next_24h = entries[:8] if len(entries) >= 8 else entries
+    # Time-based window slicing (works for any resolution)
+    next_6h = [e for e in entries if e["dt"] < now + 6 * 3600]
+    next_12h = [e for e in entries if e["dt"] < now + 12 * 3600]
+    next_24h = [e for e in entries if e["dt"] < now + 24 * 3600]
 
-    temps_6h = [e["main"]["temp"] for e in next_6h]
-    temps_24h = [e["main"]["temp"] for e in next_24h]
+    # Fallback if windows are empty (e.g. all entries are in the future)
+    if not next_6h:
+        next_6h = entries[:6]
+    if not next_12h:
+        next_12h = entries[:12]
+    if not next_24h:
+        next_24h = entries[:24]
+
+    temps_6h = [e["temp"] for e in next_6h]
+    temps_24h = [e["temp"] for e in next_24h]
 
     next_6h_high = max(temps_6h)
     next_6h_low = min(temps_6h)
@@ -152,7 +205,7 @@ def get_forecast_analysis() -> Optional[ForecastAnalysis]:
     cold_snap = next_24h_low < 40
 
     rain_coming = any(
-        e["weather"][0]["main"] in ("Rain", "Drizzle", "Thunderstorm")
+        e["condition"] in ("Rain", "Drizzle", "Thunderstorm")
         for e in next_12h
     )
 
@@ -161,15 +214,13 @@ def get_forecast_analysis() -> Optional[ForecastAnalysis]:
     hours_to_peak_cold = 0.0
 
     if heatwave:
-        # Find the entry with the highest temp and its timestamp
-        peak_entry = max(next_24h, key=lambda e: e["main"]["temp"])
+        peak_entry = max(next_24h, key=lambda e: e["temp"])
         peak_dt = peak_entry.get("dt", 0)
         if peak_dt:
             hours_to_peak_heat = max(0, (peak_dt - now) / 3600)
 
     if cold_snap:
-        # Find the entry with the lowest temp and its timestamp
-        cold_entry = min(next_24h, key=lambda e: e["main"]["temp"])
+        cold_entry = min(next_24h, key=lambda e: e["temp"])
         cold_dt = cold_entry.get("dt", 0)
         if cold_dt:
             hours_to_peak_cold = max(0, (cold_dt - now) / 3600)
@@ -233,6 +284,95 @@ def get_forecast_analysis() -> Optional[ForecastAnalysis]:
     )
 
 
+# ── Fetch: Open-Meteo (primary) ──
+
+def _fetch_open_meteo() -> dict:
+    """Fetch weather from Open-Meteo and return normalized format."""
+    resp = requests.get("https://api.open-meteo.com/v1/forecast", params={
+        "latitude": _lat,
+        "longitude": _lon,
+        "current": "temperature_2m,relative_humidity_2m,weather_code",
+        "hourly": "temperature_2m,relative_humidity_2m,weather_code,precipitation",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "temperature_unit": "fahrenheit",
+        "timeformat": "unixtime",
+        "forecast_days": 2,
+    }, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    cur = data["current"]
+    hourly = data["hourly"]
+    daily = data["daily"]
+
+    hourly_entries = []
+    for i in range(len(hourly["time"])):
+        hourly_entries.append({
+            "dt": hourly["time"][i],
+            "temp": hourly["temperature_2m"][i],
+            "humidity": hourly["relative_humidity_2m"][i],
+            "condition": _WMO_TO_CONDITION.get(hourly["weather_code"][i], "Clouds"),
+            "precipitation": hourly["precipitation"][i],
+        })
+
+    return {
+        "source": "open-meteo",
+        "current": {
+            "temp": cur["temperature_2m"],
+            "humidity": cur["relative_humidity_2m"],
+            "condition": _WMO_TO_CONDITION.get(cur["weather_code"], "Clouds"),
+        },
+        "hourly": hourly_entries,
+        "daily": {
+            "high": daily["temperature_2m_max"][0],
+            "low": daily["temperature_2m_min"][0],
+        },
+    }
+
+
+# ── Fetch: OpenWeatherMap (fallback) ──
+
+def _fetch_owm_normalized() -> dict:
+    """Fetch from OpenWeatherMap and return normalized format."""
+    current = _fetch_current()
+    forecast = _fetch_forecast()
+
+    entries = forecast.get("list", [])
+
+    hourly_entries = []
+    for e in entries:
+        hourly_entries.append({
+            "dt": e["dt"],
+            "temp": e["main"]["temp"],
+            "humidity": e["main"]["humidity"],
+            "condition": e["weather"][0]["main"],
+            "precipitation": e.get("rain", {}).get("3h", 0) + e.get("snow", {}).get("3h", 0),
+        })
+
+    # Daily high/low from first 8 forecast entries (best free tier can do)
+    if entries:
+        today_temps = [e["main"]["temp"] for e in entries[:8]]
+        daily_high = max(today_temps)
+        daily_low = min(today_temps)
+    else:
+        daily_high = current["main"]["temp"]
+        daily_low = current["main"]["temp"]
+
+    return {
+        "source": "owm",
+        "current": {
+            "temp": current["main"]["temp"],
+            "humidity": current["main"]["humidity"],
+            "condition": current["weather"][0]["main"],
+        },
+        "hourly": hourly_entries,
+        "daily": {
+            "high": daily_high,
+            "low": daily_low,
+        },
+    }
+
+
 def _fetch_current() -> dict:
     """Fetch current weather from OpenWeatherMap."""
     url = "https://api.openweathermap.org/data/2.5/weather"
@@ -259,15 +399,14 @@ def _fetch_forecast() -> dict:
     return resp.json()
 
 
+# ── Build output from normalized cache ──
+
 def _build_weather_data(cached: dict, is_stale: bool,
                         stale_hours: float = 0) -> WeatherData:
-    """Build WeatherData from cached API responses."""
-    current = cached["current"]
-    forecast = cached["forecast"]
-
-    current_temp = current["main"]["temp"]
-    humidity = current["main"]["humidity"]
-    forecast_summary = _build_forecast_summary(forecast)
+    """Build WeatherData from normalized cached data."""
+    current_temp = cached["current"]["temp"]
+    humidity = cached["current"]["humidity"]
+    forecast_summary = _build_forecast_summary(cached)
 
     if is_stale:
         forecast_summary = f"[STALE - last update {stale_hours:.0f} hours ago] {forecast_summary}"
@@ -287,32 +426,33 @@ def _build_weather_data(cached: dict, is_stale: bool,
     )
 
 
-def _build_forecast_summary(forecast: dict) -> str:
-    """Condense the 5-day forecast into 1-2 sentences for the LLM."""
-    entries = forecast.get("list", [])
-    if not entries:
+def _build_forecast_summary(cached: dict) -> str:
+    """Condense forecast into 1-2 sentences for the LLM.
+    Uses true daily high/low from the normalized format."""
+    hourly = cached.get("hourly", [])
+    daily = cached.get("daily", {})
+
+    if not hourly and not daily:
         return "No forecast data available"
 
-    # Look at next 24 hours (8 x 3-hour intervals)
-    next_24h = entries[:8]
+    # True daily high/low (main improvement — Open-Meteo provides actual daily extremes)
+    high = daily.get("high", 0)
+    low = daily.get("low", 0)
 
-    temps = [e["main"]["temp"] for e in next_24h]
-    high = max(temps)
-    low = min(temps)
-
-    # Get dominant weather condition
+    # Dominant weather condition from next 24h of hourly data
+    next_24h = hourly[:24] if len(hourly) >= 24 else hourly
     conditions = {}
     for e in next_24h:
-        desc = e["weather"][0]["main"]
-        conditions[desc] = conditions.get(desc, 0) + 1
-    dominant = max(conditions, key=conditions.get)
+        cond = e["condition"]
+        conditions[cond] = conditions.get(cond, 0) + 1
+    dominant = max(conditions, key=conditions.get) if conditions else "Clear"
 
-    # Check for rain
     rain_count = sum(1 for e in next_24h
-                     if e["weather"][0]["main"] in ("Rain", "Drizzle", "Thunderstorm"))
+                     if e["condition"] in ("Rain", "Drizzle", "Thunderstorm"))
 
     summary = f"{dominant.lower()}, high {high:.0f}F low {low:.0f}F"
     if rain_count > 0:
-        summary += f", rain expected ({rain_count} of next 8 periods)"
+        total = len(next_24h)
+        summary += f", rain expected ({rain_count} of next {total} periods)"
 
     return summary
