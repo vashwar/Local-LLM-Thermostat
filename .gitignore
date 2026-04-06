@@ -53,3 +53,4 @@ nul
 temp/
 tmp/
 test_output/
+testHarness/
