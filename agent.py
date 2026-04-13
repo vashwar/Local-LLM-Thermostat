@@ -520,6 +520,11 @@ async def check_and_switch_mode(thermo_state, weather_data) -> str:
         await asyncio.to_thread(nest_api.set_mode, desired_mode, thermo_state.device_id)
         # Update the thermo_state object with the new mode
         thermo_state.mode = mode_map[desired_mode]
+        # Send telegram notification for mode change
+        await send_telegram(
+            f"[{zone}] HVAC mode switched to {desired_mode} "
+            f"(forecast daily high: {daily_high:.0f}F)"
+        )
 
     return thermo_state.mode
 
