@@ -44,7 +44,7 @@ SYSTEM_PROMPT = """You are a thermostat agent for the {zone_name} zone.
 
 {user_messages}
 
-Respond with JSON only:
+Respond with ONLY this JSON (action MUST be "set_temperature" or "no_change"):
 {{"action":"set_temperature"|"no_change","temperature":<{temp_min}-{temp_max} or null>,"reasoning":"<brief>","message_to_user":"<optional or null>"}}"""
 
 # ── Module-level state ────────────────────────────────────────────
@@ -193,7 +193,7 @@ def build_context(thermo_state, weather_data, all_states=None) -> str:
     # ── Build state summary (compact) ──
     state_lines = [
         f"Indoor: {thermo_state.indoor_temp}F, {thermo_state.humidity}% humidity",
-        f"Mode: {thermo_state.mode}, target: {thermo_state.target_temp or 'none'}F",
+        f"HVAC mode: {thermo_state.mode}, target: {thermo_state.target_temp or 'none'}F",
         f"Outdoor: {weather_data.current_temp}F, {weather_data.forecast_summary}",
         f"Time: {now.strftime('%I:%M %p')} {now.strftime('%A')}",
     ]
@@ -501,6 +501,29 @@ async def execute_decision(decision: dict, thermo_state, weather_data, raw_respo
     return action
 
 
+async def check_and_switch_mode(thermo_state, weather_data) -> str:
+    """
+    Check if HVAC mode needs to be switched based on forecast daily high.
+    Returns the current/new mode as lowercase string ("heating", "cooling", etc).
+    This should be called BEFORE building LLM context so comfort ranges are correct.
+    """
+    zone = thermo_state.name
+    forecast = weather.get_forecast_analysis()
+    daily_high = forecast.next_24h_high if forecast else weather_data.current_temp
+    desired_mode = "COOL" if daily_high >= 65 else "HEAT"
+    current_mode = thermo_state.mode  # "cooling", "heating", "auto", "off"
+    mode_map = {"COOL": "cooling", "HEAT": "heating"}
+
+    if current_mode != mode_map.get(desired_mode):
+        logger.info("[%s] Switching HVAC mode to %s (daily high %.0fF)",
+                    zone, desired_mode, daily_high)
+        await asyncio.to_thread(nest_api.set_mode, desired_mode, thermo_state.device_id)
+        # Update the thermo_state object with the new mode
+        thermo_state.mode = mode_map[desired_mode]
+
+    return thermo_state.mode
+
+
 def generate_weekly_report() -> str:
     """Generate a Sunday summary from climate_log."""
     since = datetime.utcnow() - timedelta(days=7)
@@ -586,6 +609,9 @@ async def run_evaluation_cycle() -> Optional[dict]:
         for thermo_state in all_states:
             zone = thermo_state.name
             logger.info("[%s] Running LLM evaluation...", zone)
+
+            # Check and switch HVAC mode BEFORE building context (so comfort ranges are correct)
+            await check_and_switch_mode(thermo_state, weather_data)
 
             # Build context with awareness of all zones
             system_prompt = build_context(thermo_state, weather_data, all_states)
