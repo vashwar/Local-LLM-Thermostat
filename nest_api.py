@@ -170,7 +170,9 @@ def set_temperature(temp_f: float, device_id: str = None) -> bool:
         }, timeout=15)
 
     if resp.status_code == 200:
-        _last_known_targets[device_id] = temp_f
+        # Store the round-tripped value (what the API will read back) to avoid
+        # Celsius rounding mismatches triggering false manual-override detections.
+        _last_known_targets[device_id] = round(temp_c * 9 / 5 + 32, 1)
         name = _device_name(device_id)
         logger.info("[%s] Temperature set to %.1fF (%.1fC)", name, temp_f, temp_c)
         return True
@@ -205,6 +207,10 @@ def set_mode(mode: str, device_id: str = None) -> bool:
         }, timeout=15)
 
     if resp.status_code == 200:
+        # Clear last known target so the mode switch (which changes the target
+        # field from coolCelsius to heatCelsius or vice versa) doesn't trigger
+        # a false manual-override detection on the next cycle.
+        _last_known_targets.pop(device_id, None)
         logger.info("Mode set to %s", mode)
         return True
     else:
@@ -220,7 +226,7 @@ def detect_manual_override(device_id: str, current_target: Optional[float]) -> b
         _last_known_targets[device_id] = current_target
         return False
 
-    if abs(current_target - last) > 0.5:
+    if abs(current_target - last) > 1.5:
         name = _device_name(device_id)
         logger.info("[%s] Manual override detected: %.1fF -> %.1fF", name, last, current_target)
         _last_known_targets[device_id] = current_target
