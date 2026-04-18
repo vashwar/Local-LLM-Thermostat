@@ -33,6 +33,7 @@ TEMP_MIN = 65
 TEMP_MAX = 80
 MAX_CHANGES_PER_HOUR = 6
 MANUAL_OVERRIDE_BACKOFF_MINUTES = 120
+USER_REQUEST_BACKOFF_MINUTES = 40
 MODE_TRANSITION_GAP_MINUTES = 5
 
 # ── System prompt — compact for Qwen 4B ──────────────────────────
@@ -55,6 +56,8 @@ _user_triggered: bool = False  # True when evaluation was triggered by a user me
 _user_message_eval_counter: Optional[int] = None  # Counter when last user message arrived
 USER_MESSAGE_MAX_CYCLES = 2  # Disregard user message after this many eval cycles
 _telegram_send_fn = None  # Set by telegram_bot on startup
+_last_user_request_time: Optional[datetime] = None  # When last user-triggered change executed
+_daily_high_cache: tuple = (None, None)  # (date_str, daily_high_F) — locked on first eval of the day
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -203,10 +206,15 @@ def build_context(thermo_state, weather_data, all_states=None) -> str:
                 state_lines.append(f"Other zone {s.name}: {s.indoor_temp}F, target={s.target_temp}F")
 
     # ── Analyze situation in Python and build directive ──
-    directive = _build_directive(thermo_state, weather_data, now, comfort, sched, recent_msgs)
+    directive, is_user_request = _build_directive(thermo_state, weather_data, now, comfort, sched, recent_msgs)
 
     # ── Format user messages (compact) ──
-    user_msg_section = _format_user_messages(recent_msgs, now)
+    # When a user request is active (Path A), only show the latest message
+    # (not the last 3) to avoid older messages confusing zone routing.
+    if is_user_request:
+        user_msg_section = _format_user_messages(recent_msgs[-1:], now)
+    else:
+        user_msg_section = _format_user_messages(recent_msgs, now)
 
     return SYSTEM_PROMPT.format(
         zone_name=thermo_state.name,
@@ -318,7 +326,7 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
             f"RULE 3: If the message says 'both', 'all', 'house', or 'everything', output the requested temperature.\n",
             f"RULE 4: If the message ONLY targets the OTHER ZONE or its aliases, you MUST output \"action\": \"no_change\"."
         ]
-        return "DIRECTIVE:\n" + "".join(parts)
+        return "DIRECTIVE:\n" + "".join(parts), True
 
 
     # ── Path B: No user message → Python provides context, energy-saving bias ──
@@ -379,7 +387,7 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
             if "?" in last_text or any(w in last_text.lower() for w in ["what", "how", "when", "is it", "will it"]):
                 parts.append(f"User asked: '{last_text}'. Answer in message_to_user. Use no_change.")
 
-    return "DIRECTIVE: " + " ".join(parts)
+    return "DIRECTIVE: " + " ".join(parts), False
 
 
 def _format_user_messages(messages: list, now: datetime) -> str:
@@ -443,7 +451,8 @@ def check_guardrails(decision: dict, user_triggered: bool = False) -> Tuple[bool
     return True, None
 
 
-async def execute_decision(decision: dict, thermo_state, weather_data, raw_response: str):
+async def execute_decision(decision: dict, thermo_state, weather_data, raw_response: str,
+                           user_triggered: bool = False):
     """Execute the agent's decision — call Nest API if needed, log to DB."""
     reasoning = decision.get("reasoning", "")
     temperature = decision.get("temperature")
@@ -487,6 +496,18 @@ async def execute_decision(decision: dict, thermo_state, weather_data, raw_respo
 
     # Execute temperature change
     if action == "set_temperature" and temperature is not None:
+        # Edge case: user wants to heat when system is in cool mode.
+        # Indoor is 65-70F and target > indoor — cool mode won't heat.
+        # Switch to HEAT so the setpoint actually activates the furnace.
+        if (user_triggered
+                and thermo_state.mode == "cooling"
+                and temperature > thermo_state.indoor_temp
+                and 65 <= thermo_state.indoor_temp <= 70):
+            logger.info("[%s] User wants %.0fF but indoor is %.0fF in cool mode — switching to HEAT",
+                        zone, temperature, thermo_state.indoor_temp)
+            await asyncio.to_thread(nest_api.set_mode, "HEAT", thermo_state.device_id)
+            await asyncio.sleep(10)  # Let Nest propagate the mode change
+
         success = await asyncio.to_thread(
             nest_api.set_temperature, temperature, thermo_state.device_id
         )
@@ -506,10 +527,22 @@ async def check_and_switch_mode(thermo_state, weather_data) -> str:
     Check if HVAC mode needs to be switched based on forecast daily high.
     Returns the current/new mode as lowercase string ("heating", "cooling", etc).
     This should be called BEFORE building LLM context so comfort ranges are correct.
+
+    The daily high is locked on the first evaluation of each day to prevent
+    mode flip-flopping as the rolling 24h forecast window shifts.
     """
+    global _daily_high_cache
     zone = thermo_state.name
-    forecast = weather.get_forecast_analysis()
-    daily_high = forecast.next_24h_high if forecast else weather_data.current_temp
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if _daily_high_cache[0] == today:
+        daily_high = _daily_high_cache[1]
+    else:
+        forecast = weather.get_forecast_analysis()
+        daily_high = forecast.next_24h_high if forecast else weather_data.current_temp
+        _daily_high_cache = (today, daily_high)
+        logger.info("Daily high locked for %s: %.0fF", today, daily_high)
+
     desired_mode = "COOL" if daily_high >= 65 else "HEAT"
     current_mode = thermo_state.mode  # "cooling", "heating", "auto", "off"
     mode_map = {"COOL": "cooling", "HEAT": "heating"}
@@ -563,10 +596,19 @@ async def run_evaluation_cycle() -> Optional[dict]:
     Each zone gets its own LLM call with awareness of other zones.
     Returns the last decision (for Telegram response).
     """
-    global _user_triggered
+    global _user_triggered, _last_user_request_time
     user_triggered = _user_triggered
     _user_triggered = False  # Reset for next cycle
     logger.info("Starting evaluation cycle (user_triggered=%s)", user_triggered)
+
+    # Back off after user requests — let the user's setting hold
+    if not user_triggered and _last_user_request_time is not None:
+        elapsed = (datetime.now() - _last_user_request_time).total_seconds() / 60
+        if elapsed < USER_REQUEST_BACKOFF_MINUTES:
+            remaining = int(USER_REQUEST_BACKOFF_MINUTES - elapsed)
+            logger.info("User request backoff: %d minutes remaining, skipping evaluation", remaining)
+            return None
+
     last_decision = None
     _cycle_decisions = []  # Track all zone decisions for summary
 
@@ -651,10 +693,15 @@ async def run_evaluation_cycle() -> Optional[dict]:
                 continue
 
             # Execute
-            await execute_decision(decision, thermo_state, weather_data, response_text)
+            await execute_decision(decision, thermo_state, weather_data, response_text,
+                                   user_triggered=user_triggered)
             decision["zone"] = zone
             _cycle_decisions.append(decision)
             last_decision = decision
+
+            # Record user request time so regular evaluations back off
+            if user_triggered and decision["action"] == "set_temperature":
+                _last_user_request_time = datetime.now()
 
             logger.info("[%s] Cycle complete: action=%s, temp=%s",
                          zone, decision["action"], decision.get("temperature"))

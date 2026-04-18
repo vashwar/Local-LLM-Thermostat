@@ -97,7 +97,7 @@ class TestModeStringRegression:
         comfort = agent._config["comfort"]
         sched = agent._config["schedule"]
 
-        directive = agent._build_directive(state, MagicMock(current_temp=35.0),
+        directive, _ = agent._build_directive(state, MagicMock(current_temp=35.0),
                                            now, comfort, sched, [])
 
         assert "68-72F" in directive, \
@@ -112,7 +112,7 @@ class TestModeStringRegression:
         comfort = agent._config["comfort"]
         sched = agent._config["schedule"]
 
-        directive = agent._build_directive(state, MagicMock(current_temp=95.0),
+        directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
                                            now, comfort, sched, [])
 
         assert "75-80F" in directive
@@ -127,7 +127,7 @@ class TestModeStringRegression:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=78.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=78.0),
                                                now, comfort, sched, [])
 
         assert "summer" in directive.lower() or "cool" in directive.lower(), \
@@ -142,7 +142,7 @@ class TestModeStringRegression:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=30.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=30.0),
                                                now, comfort, sched, [])
 
         assert "winter" in directive.lower() or "heat" in directive.lower() or "cold" in directive.lower(), \
@@ -460,7 +460,7 @@ class TestDirective:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=95.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
                                                now, comfort, sched, messages)
 
         assert "YOUR ZONE: Upstairs" in directive
@@ -477,7 +477,7 @@ class TestDirective:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=95.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
                                                now, comfort, sched, messages)
 
         assert "'both'" in directive and "'all'" in directive
@@ -493,7 +493,7 @@ class TestDirective:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=95.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
                                                now, comfort, sched, messages)
 
         assert "RULE 1:" in directive
@@ -510,7 +510,7 @@ class TestDirective:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=95.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
                                                now, comfort, sched, messages)
 
         assert "PRIORITY" not in directive
@@ -525,7 +525,7 @@ class TestDirective:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=85.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=85.0),
                                                now, comfort, sched, [])
 
         assert "Prefer no_change to save energy" in directive
@@ -539,7 +539,7 @@ class TestDirective:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=85.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=85.0),
                                                now, comfort, sched, [])
 
         assert "guide only" in directive
@@ -553,7 +553,7 @@ class TestDirective:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=90.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=90.0),
                                                now, comfort, sched, [])
 
         assert "Pre-cool" in directive
@@ -567,7 +567,7 @@ class TestDirective:
 
         with patch("agent.weather") as mock_weather:
             mock_weather.get_forecast_analysis.return_value = None
-            directive = agent._build_directive(state, MagicMock(current_temp=72.0),
+            directive, _ = agent._build_directive(state, MagicMock(current_temp=72.0),
                                                now, comfort, sched, [])
 
         assert "Prefer no_change" in directive
@@ -584,7 +584,7 @@ class TestDirective:
             now = datetime(2025, 7, 14, hour, 0)  # Monday
             with patch("agent.weather") as mock_weather:
                 mock_weather.get_forecast_analysis.return_value = None
-                directive = agent._build_directive(state, MagicMock(current_temp=85.0),
+                directive, _ = agent._build_directive(state, MagicMock(current_temp=85.0),
                                                    now, comfort, sched, [])
             assert "Work hours" not in directive, \
                 f"'Work hours' found at {hour}:00 — {directive}"
