@@ -1,6 +1,14 @@
 # AI Thermostat Agent
 
-An autonomous smart climate controller that uses a locally-hosted AI (Qwen 4B via llama.cpp) to manage Nest thermostats. It reads indoor conditions, outdoor weather forecasts, and natural language instructions from a Telegram bot to make intelligent temperature decisions — all running 100% locally with zero cloud AI costs.
+I built a local AI agent that manages my home's two Nest thermostats autonomously. My wife texts "it's cold" and the system reasons about indoor temp, outdoor forecast, time of day, and HVAC mode — then explains its reasoning in plain English before adjusting the temperature. All AI runs locally on a consumer-grade GPU using a 2B parameter SLM (Gemma 4 E2B via llama.cpp). Zero cloud costs. Zero data leaving my machine. It has been managing my home's climate autonomously since March 31, 2026.
+
+**Total project cost: $5** (Google's one-time SDM API registration fee). Replaces a $500 pair of Nest Learning Thermostats.
+
+> For the product thinking, design decisions, and lessons learned behind this project, see [PRODUCT.md](PRODUCT.md).
+
+## How It Works
+
+Every 20 minutes, the agent runs an evaluation cycle. Python does 90% of the reasoning (time period, comfort range, forecast analysis, zone routing) and compresses it into a ~200-token directive. The SLM makes the final call and generates a human-readable explanation. Hard-coded guardrails in Python enforce safety before any action reaches the Nest API.
 
 ```
 start.bat
@@ -12,46 +20,49 @@ start.bat
 
 Single Evaluation Cycle:
   1. Read indoor temp/humidity from Nest API (per zone)
-  2. Read outdoor weather + forecast from OpenWeatherMap
+  2. Read outdoor weather + forecast from Open-Meteo
   3. Read recent Telegram messages for user requests
   4. Start llama-server (on-demand, GPU)
-  5. Send context to LLM → get JSON decision
-  6. Validate response + check guardrails
+  5. Python pre-processes context → compact directive for SLM
+  6. SLM returns JSON decision → validated against guardrails
   7. Execute temperature change via Nest API (if needed)
   8. Stop llama-server (free GPU memory)
   9. Log everything to SQLite
 ```
 
+When you send a Telegram message, the agent immediately runs an extra evaluation cycle with your request as priority context.
+
 ## Features
 
-- **Multi-zone support** — manages multiple Nest thermostats independently (e.g. Upstairs Bedroom, Downstairs Kitchen)
-- **Local AI brain** — Qwen 4B runs on your GPU via llama.cpp, no cloud API needed
+- **Multi-zone support** — manages 2 Nest thermostats independently (Upstairs Bedroom, Downstairs Kitchen)
+- **Local SLM brain** — Gemma 4 E2B (2B params) runs on a consumer GPU via llama.cpp, no cloud API needed
 - **On-demand LLM** — llama-server starts only during evaluations, then shuts down to free GPU memory
 - **Telegram bot** — send natural language commands ("set upstairs to 78"), get status, export data
 - **User requests are priority** — the AI always follows your explicit instructions over its own logic
-- **Safety guardrails** — hard-coded temp bounds (60-85F), rate limiting, manual override detection
-- **Weather-aware** — considers outdoor temperature, forecast, and weather alerts
-- **Schedule-aware** — knows sleep/wake times, work hours, weekends
+- **Safety guardrails** — hard-coded temp bounds (65-80F), rate limiting, manual override detection
+- **Weather-aware** — Open-Meteo primary (true daily high/low, hourly resolution), OWM fallback
+- **Schedule-aware** — knows sleep/wake times, adjusts comfort ranges by season and HVAC mode
+- **SLM-optimized** — Python pre-processes all reasoning into a ~200-token prompt, respecting the 4096 context window
+- **Benchmarked** — 59-scenario test harness validated both Qwen 4B and Gemma 4 E2B at 94.9% accuracy
 - **Climate logging** — full SQLite history for analysis and weekly reports
 
 ## Prerequisites
 
 - **Windows 10/11** (tested on Windows 11)
 - **Python 3.10+**
-- **NVIDIA GPU** with enough VRAM for Qwen 4B (~3GB)
+- **NVIDIA GPU** with enough VRAM for a 2B SLM (~2GB)
 - **llama.cpp** — `llama-server.exe` compiled or downloaded
-- **A Qwen 4B GGUF model** — e.g. `Qwen3-4B-Instruct-2507-Q4_K_M.gguf`
+- **A GGUF model** — e.g. Gemma 4 E2B (`gemma-4-e2b-it-Q8_0.gguf`) or Qwen 4B
 - **Google Nest thermostat(s)** with Smart Device Management API access
-- **OpenWeatherMap** free account
 - **Telegram** account
 
 ## Setup Guide
 
 ### Step 1: Install llama.cpp
 
-1. Download a prebuilt release from [llama.cpp releases](https://github.com/ggerganov/llama.cpp/releases) (pick the CUDA version matching your GPU)
+1. Download a prebuilt release from [llama.cpp releases](https://github.com/ggerganov/llama.cpp/releases) (pick the CUDA/Vulkan version matching your GPU)
 2. Extract `llama-server.exe` to a folder on your system (e.g., `C:\llama-cpp\llama-server.exe`)
-3. Download the Qwen 4B GGUF model from [HuggingFace](https://huggingface.co/Qwen) and save it somewhere (e.g., `C:\models\Qwen3-4B-Instruct-Q4_K_M.gguf`)
+3. Download a GGUF model — Gemma 4 E2B (recommended, lighter) or Qwen 4B from [HuggingFace](https://huggingface.co/)
 4. Note the full paths to both files — you'll add them to `config.yaml` in Step 5
 
 ### Step 2: Get Nest API Access
@@ -119,12 +130,11 @@ It will ask for:
 
 This saves your tokens to `nest_tokens.json` and lists your devices. Note the **device IDs** — you'll need them for `config.yaml`.
 
-### Step 3: Get an OpenWeatherMap API Key
+### Step 3: Get Your Location Coordinates
 
-1. Create a free account at [OpenWeatherMap](https://openweathermap.org/api)
-2. Go to **API Keys** in your account settings
-3. Copy your API key (free tier allows 1,000 calls/day — this agent uses ~72/day)
-4. Find your home's latitude and longitude (use [Google Maps](https://maps.google.com), right-click your location)
+1. Find your home's latitude and longitude (use [Google Maps](https://maps.google.com), right-click your location)
+2. The agent uses [Open-Meteo](https://open-meteo.com/) as its primary weather source — no API key needed
+3. (Optional) For fallback weather, create a free [OpenWeatherMap](https://openweathermap.org/api) account and copy your API key
 
 ### Step 4: Create a Telegram Bot
 
@@ -151,7 +161,7 @@ llm:
   server_exe: "C:\\path\\to\\llama-server.exe"         # Full path to llama-server executable
   model_path: "C:\\path\\to\\model.gguf"               # Full path to Qwen 4B GGUF model
   endpoint: "http://localhost:8080/v1/chat/completions"
-  model: "qwen4b"
+  model: "gemma-4-e2b"
   temperature: 0.3
   top_p: 0.9
   max_tokens: 500
@@ -263,15 +273,18 @@ AIThermostat/
 ├── agent.py           # Main brain — evaluation loop, LLM calls, guardrails
 ├── telegram_bot.py    # Telegram bot — commands, message handling
 ├── nest_api.py        # Nest SDM API wrapper — read state, set temperature
-├── weather.py         # OpenWeatherMap client with caching
+├── weather.py         # Weather client — Open-Meteo primary, OWM fallback
 ├── database.py        # SQLite logging — climate, decisions, messages, errors
 ├── llm_server.py      # On-demand llama-server lifecycle manager
 ├── nest_setup.py      # One-time setup script for Nest API tokens
 ├── test_qwen_4b.py    # LLM reliability test (18 scenarios)
 ├── config.yaml        # All configuration
-├── nest_tokens.json   # Nest API credentials (generated by nest_setup.py)
 ├── requirements.txt   # Python dependencies
 ├── start.bat          # Windows startup script
+├── PRODUCT.md         # Product decisions, pivots, and learnings
+├── ARCHITECTURE.md    # System architecture and component details
+├── tests/             # 49 unit tests (pytest)
+├── DesignDOC/         # Original design document
 └── thermostat.db      # SQLite database (created on first run)
 ```
 
@@ -303,5 +316,5 @@ AIThermostat/
 
 All AI processing runs locally on your hardware. No data is sent to cloud AI services. The only external API calls are:
 - **Nest SDM API** — to read/control your thermostat (Google)
-- **OpenWeatherMap API** — to get weather data
+- **Open-Meteo API** — to get weather data (no API key, no account needed)
 - **Telegram Bot API** — to send/receive messages
