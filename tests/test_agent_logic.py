@@ -3,8 +3,9 @@ Tests for agent.py core logic — directive builder, guardrails, validation.
 """
 
 import json
+import asyncio
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 
@@ -588,3 +589,106 @@ class TestDirective:
                                                    now, comfort, sched, [])
             assert "Work hours" not in directive, \
                 f"'Work hours' found at {hour}:00 — {directive}"
+
+
+# ── Mode Switch + Temperature Adjustment Tests ───────────────────
+# Regression: mode switch from COOL→HEAT left stale cool target (75F)
+# which caused furnace to overheat past winter comfort range (68-72F).
+
+class TestCheckAndSwitchMode:
+    """Tests for check_and_switch_mode: after switching HVAC mode, the target
+    temperature must be adjusted to the new mode's comfort zone."""
+
+    def _run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    @patch("agent.send_telegram", new_callable=AsyncMock)
+    @patch("agent.nest_api")
+    @patch("agent.weather")
+    def test_cool_to_heat_sets_winter_comfort_low(self, mock_weather, mock_nest, mock_tg):
+        """Switching COOL→HEAT should set target to winter comfort low (68F)."""
+        mock_forecast = MagicMock()
+        mock_forecast.next_24h_high = 55.0  # Below 65 → HEAT
+        mock_weather.get_forecast_analysis.return_value = mock_forecast
+        mock_nest.set_mode.return_value = True
+        mock_nest.set_temperature.return_value = True
+
+        state = _make_thermo_state(mode="cooling", indoor_temp=71.0, target_temp=75.0)
+        weather_data = MagicMock(current_temp=55.0)
+
+        # Reset daily cache to force recalculation
+        agent._daily_high_cache = (None, None)
+
+        self._run_async(agent.check_and_switch_mode(state, weather_data))
+
+        assert state.mode == "heating"
+        assert state.target_temp == 68  # winter_range[0]
+        mock_nest.set_mode.assert_called_once_with("HEAT", "test-device-id")
+        mock_nest.set_temperature.assert_called_once_with(68, "test-device-id")
+
+    @patch("agent.send_telegram", new_callable=AsyncMock)
+    @patch("agent.nest_api")
+    @patch("agent.weather")
+    def test_heat_to_cool_sets_summer_comfort_low(self, mock_weather, mock_nest, mock_tg):
+        """Switching HEAT→COOL should set target to summer comfort low (75F)."""
+        mock_forecast = MagicMock()
+        mock_forecast.next_24h_high = 85.0  # Above 65 → COOL
+        mock_weather.get_forecast_analysis.return_value = mock_forecast
+        mock_nest.set_mode.return_value = True
+        mock_nest.set_temperature.return_value = True
+
+        state = _make_thermo_state(mode="heating", indoor_temp=70.0, target_temp=68.0)
+        weather_data = MagicMock(current_temp=80.0)
+
+        agent._daily_high_cache = (None, None)
+
+        self._run_async(agent.check_and_switch_mode(state, weather_data))
+
+        assert state.mode == "cooling"
+        assert state.target_temp == 75  # summer_range[0]
+        mock_nest.set_mode.assert_called_once_with("COOL", "test-device-id")
+        mock_nest.set_temperature.assert_called_once_with(75, "test-device-id")
+
+    @patch("agent.send_telegram", new_callable=AsyncMock)
+    @patch("agent.nest_api")
+    @patch("agent.weather")
+    def test_no_switch_no_temp_change(self, mock_weather, mock_nest, mock_tg):
+        """When mode doesn't change, temperature should not be touched."""
+        agent._daily_high_cache = (None, None)
+
+        mock_forecast = MagicMock()
+        mock_forecast.next_24h_high = 85.0  # COOL
+        mock_weather.get_forecast_analysis.return_value = mock_forecast
+
+        state = _make_thermo_state(mode="cooling", indoor_temp=76.0, target_temp=75.0)
+        weather_data = MagicMock(current_temp=85.0)
+
+        self._run_async(agent.check_and_switch_mode(state, weather_data))
+
+        assert state.mode == "cooling"
+        assert state.target_temp == 75.0  # Unchanged
+        mock_nest.set_mode.assert_not_called()
+        mock_nest.set_temperature.assert_not_called()
+
+    @patch("agent.send_telegram", new_callable=AsyncMock)
+    @patch("agent.nest_api")
+    @patch("agent.weather")
+    def test_telegram_notification_includes_new_target(self, mock_weather, mock_nest, mock_tg):
+        """Mode switch telegram message should mention the new target temperature."""
+        agent._daily_high_cache = (None, None)
+
+        mock_forecast = MagicMock()
+        mock_forecast.next_24h_high = 55.0
+        mock_weather.get_forecast_analysis.return_value = mock_forecast
+        mock_nest.set_mode.return_value = True
+        mock_nest.set_temperature.return_value = True
+
+        state = _make_thermo_state(mode="cooling", indoor_temp=71.0, target_temp=75.0)
+        weather_data = MagicMock(current_temp=55.0)
+
+        self._run_async(agent.check_and_switch_mode(state, weather_data))
+
+        mock_tg.assert_called_once()
+        msg = mock_tg.call_args[0][0]
+        assert "HEAT" in msg
+        assert "68" in msg  # New target mentioned

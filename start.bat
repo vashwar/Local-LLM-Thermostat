@@ -9,7 +9,7 @@ echo.
 set AGENT_DIR=%~dp0
 
 :: Check llama-server exists (needed on-demand)
-if not exist "C:\VashwarTests\EmailOrganizer\llama-server\llama-server.exe" (
+if not exist "C:\llamaserver\llama-b8660-bin-win-vulkan-x64\llama-server.exe" (
     echo ERROR: llama-server not found
     pause
     exit /b 1

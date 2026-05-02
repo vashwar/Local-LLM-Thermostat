@@ -59,8 +59,9 @@ def start() -> bool:
             _server_exe,
             "-m", _model_path,
             "--port", str(_port),
-            "-c", "4096",
-            "-ngl", "99",
+            "-c", "2048",
+            "-ngl", "0",
+            "-np", "1",
             "--reasoning", "off",
             "--log-disable"
         ],

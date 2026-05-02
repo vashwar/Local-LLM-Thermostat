@@ -553,9 +553,24 @@ async def check_and_switch_mode(thermo_state, weather_data) -> str:
         await asyncio.to_thread(nest_api.set_mode, desired_mode, thermo_state.device_id)
         # Update the thermo_state object with the new mode
         thermo_state.mode = mode_map[desired_mode]
+
+        # Set temperature to the new mode's comfort zone.
+        # Without this, the old mode's target persists (e.g. cool target 75F
+        # becomes a heat target of 75F, overheating past winter range 68-72F).
+        comfort = _config.get("comfort", {})
+        if desired_mode == "HEAT":
+            new_target = comfort.get("winter_range", [68, 72])[0]  # comfort low
+        else:
+            new_target = comfort.get("summer_range", [75, 80])[0]  # comfort low
+        await asyncio.sleep(5)  # Let Nest propagate the mode change
+        await asyncio.to_thread(nest_api.set_temperature, new_target, thermo_state.device_id)
+        thermo_state.target_temp = new_target
+        logger.info("[%s] Set target to %.0fF for %s mode comfort zone",
+                    zone, new_target, desired_mode)
+
         # Send telegram notification for mode change
         await send_telegram(
-            f"[{zone}] HVAC mode switched to {desired_mode} "
+            f"[{zone}] HVAC mode switched to {desired_mode} → target set to {new_target:.0f}F "
             f"(forecast daily high: {daily_high:.0f}F)"
         )
 
