@@ -125,6 +125,24 @@ def init_db(db_path: str):
             INSERT OR IGNORE INTO heartbeat (id, last_cycle) VALUES (1, NULL)
         """)
 
+        # location_log — OwnTracks location events (90-day retention)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS location_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                event_type TEXT,
+                topic TEXT,
+                lat REAL,
+                lon REAL,
+                miles_from_home REAL,
+                vacation_mode INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_location_log_timestamp
+            ON location_log(timestamp)
+        """)
+
         # manual_overrides — timestamps of detected manual changes
         conn.execute("""
             CREATE TABLE IF NOT EXISTS manual_overrides (
@@ -204,6 +222,21 @@ def log_error(component: str, error_type: str, details: str):
             INSERT INTO errors (component, error_type, details)
             VALUES (?, ?, ?)
         """, (component, error_type, details))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_location_event(event_type: str, topic: str, lat: float, lon: float,
+                       miles_from_home: float, vacation_mode: bool):
+    """Log an OwnTracks location event (90-day retention)."""
+    conn = _get_conn()
+    try:
+        conn.execute("""
+            INSERT INTO location_log
+            (event_type, topic, lat, lon, miles_from_home, vacation_mode)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (event_type, topic, lat, lon, miles_from_home, int(vacation_mode)))
         conn.commit()
     finally:
         conn.close()
@@ -335,7 +368,7 @@ def cleanup_old_records(retention_days: int = 90):
     cutoff = (datetime.utcnow() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
     conn = _get_conn()
     try:
-        for table in ["decisions", "messages", "errors", "manual_overrides"]:
+        for table in ["decisions", "messages", "errors", "manual_overrides", "location_log"]:
             conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
         conn.commit()
         logger.info("Cleaned up records older than %d days", retention_days)

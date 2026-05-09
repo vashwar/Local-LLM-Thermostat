@@ -2,3 +2,4 @@ requests
 pyyaml
 python-telegram-bot>=21.0
 aiohttp
+paho-mqtt>=2.0

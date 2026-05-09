@@ -16,6 +16,7 @@ from telegram.ext import (
 
 import agent
 import database
+import location
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if w.is_stale:
             lines.append("(Weather data is stale)")
 
+        # Vacation mode status
+        if location.is_vacation_mode():
+            lines.append("\nVACATION MODE: ACTIVE")
+        phones = location.get_phone_locations()
+        if phones:
+            lines.append("\nPhone locations:")
+            for topic, info in phones.items():
+                name = topic.split("/")[-2] if "/" in topic else topic
+                lines.append(f"  {name}: {info['miles_from_home']:.1f} mi from home")
+
         if last_result:
             lines.append("")
             zone = last_result.get("zone", "")
@@ -168,6 +179,41 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Export command failed: %s", e)
         await _safe_reply(update.message,f"Error exporting data: {e}")
+
+
+async def cmd_vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /vacation command — show vacation mode status and phone distances."""
+    if not _is_authorized(update.effective_chat.id):
+        return
+
+    try:
+        lines = ["Vacation Mode Status", "=" * 25]
+
+        if location.is_vacation_mode():
+            lines.append("Status: ACTIVE")
+            lines.append(f"Comfort range: {location.get_vacation_temp_min()}-{location.get_vacation_temp_max()}F")
+            lines.append(f"Eval interval: {location.get_vacation_eval_interval_minutes()} min")
+        else:
+            lines.append("Status: OFF")
+            lines.append(f"Normal guardrails: {agent.TEMP_MIN_NORMAL}-{agent.TEMP_MAX_NORMAL}F")
+
+        phones = location.get_phone_locations()
+        if phones:
+            lines.append(f"\nGeofence: {location._geofence_miles:.0f} mi")
+            lines.append("Phones:")
+            for topic, info in phones.items():
+                name = topic.split("/")[-2] if "/" in topic else topic
+                dist = info["miles_from_home"]
+                status = "AWAY" if dist > location._geofence_miles else "HOME"
+                lines.append(f"  {name}: {dist:.1f} mi ({status})")
+        else:
+            lines.append("\nNo phone location data yet.")
+
+        await _safe_reply(update.message, "\n".join(lines))
+
+    except Exception as e:
+        logger.error("Vacation command failed: %s", e)
+        await _safe_reply(update.message, f"Error getting vacation status: {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,6 +346,7 @@ async def start_bot():
     _app.add_handler(CommandHandler("status", cmd_status))
     _app.add_handler(CommandHandler("history", cmd_history))
     _app.add_handler(CommandHandler("export", cmd_export))
+    _app.add_handler(CommandHandler("vacation", cmd_vacation))
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     _app.add_error_handler(_error_handler)
 

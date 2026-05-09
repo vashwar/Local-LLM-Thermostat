@@ -116,7 +116,38 @@ This is the single most important architectural decision in the project. Every A
 
 User requests from Telegram bypass rate limits and override backoff. The hierarchy is clear: **human > guardrails > AI**.
 
-### 7. Conversation over Dashboard (What "No Dashboard" Really Means)
+### 7. Vacation Mode via OwnTracks (Presence Detection Without Sensors)
+
+**Decision:** Use OwnTracks (phone GPS via MQTT) for presence detection instead of motion sensors, geofencing hardware, or smart home hub integrations.
+
+**Why — three reasons:**
+
+- **Zero hardware cost.** OwnTracks is a free app on both iOS and Android. It publishes GPS coordinates over MQTT to a local Mosquitto broker. No sensors to buy, no wiring, no batteries to replace.
+
+- **True away detection.** Motion sensors can tell you someone is in a room. They can't tell you both household members are 500 miles away on vacation. Phone GPS can. The geofence (30 miles from home) triggers vacation mode only when *both* phones are far away — not when someone is just at work or running errands.
+
+- **Graceful degradation.** If MQTT is down, OwnTracks crashes, or a phone dies, vacation mode simply stays OFF (fail-safe). The system never activates vacation mode on missing data. Stale phone data (>12 hours old) is ignored — a dead phone doesn't keep vacation mode stuck on.
+
+**What vacation mode does:**
+
+| Setting | Normal | Vacation |
+|---|---|---|
+| Comfort range | 65-80F | 65-85F |
+| Evaluation interval | 20 min | 60 min |
+| LLM directive | Time-aware comfort logic | "VACATION MODE ACTIVE. Maintain 65-85F. Prefer no_change." |
+
+The wider range saves energy (the AC won't fight to maintain 80F in an empty house on a 95F day). The longer interval reduces compute cycles. Telegram messages still work during vacation — users can override remotely if needed.
+
+**Infrastructure decisions:**
+
+- **Mosquitto MQTT broker** runs as a Windows service on the same machine as the agent. Auto-starts on reboot.
+- **Port forwarding** on the AT&T gateway (port 1883) lets phones reach the broker from anywhere — cellular, hotel WiFi, etc.
+- **DuckDNS** (free dynamic DNS) maps `vashrashinahome.duckdns.org` to the home's public IP. A scheduled task updates it every 5 minutes, so if AT&T changes the IP, the phones reconnect automatically without manual intervention.
+- **No authentication on MQTT** (for now). The `mosquitto_passwd` tool has an ARM/x64 binary incompatibility on this machine. Security relies on the port forwarding being the only exposure point. Acceptable risk for location coordinates.
+
+**PM lesson:** The original "Decisions I Explicitly Did Not Make" table listed occupancy detection as scoped out because "our schedule is predictable enough." That was true for daily patterns — but it completely missed the vacation use case. Leaving for a week with the thermostat cycling at normal comfort ranges wastes significant energy. The trigger to build this was realizing the system had no concept of "nobody is home for days."
+
+### 8. Conversation over Dashboard (What "No Dashboard" Really Means)
 
 This wasn't laziness — it was a deliberate product choice. A dashboard is a *pull* interface: the user has to go look at it. A conversation is a *push* interface: the agent tells you what it did and why.
 
@@ -131,7 +162,7 @@ What you *don't* build defines a product as much as what you do.
 | Scoped Out | Why |
 |---|---|
 | Web dashboard | Two users. Chat is the right interface. Dashboard adds complexity with zero user value for our household. |
-| Occupancy detection | Our schedule is predictable enough. Sensors add hardware cost and integration complexity for marginal improvement. |
+| ~~Occupancy detection~~ | ~~Our schedule is predictable enough. Sensors add hardware cost and integration complexity for marginal improvement.~~ **Now implemented — see Vacation Mode below.** |
 | Cloud deployment | Violates the privacy constraint. Also adds recurring cost (the thing I'm trying to avoid). |
 | Multi-user preferences | My wife and I have similar comfort ranges. Personalization per user is over-engineering for two people who agree on temperature. |
 | Voice assistant integration | Would require cloud (Alexa/Google) or complex local setup. Telegram is already on our phones and faster than talking to a speaker. |
@@ -173,6 +204,16 @@ Covered above in Key Decisions. The trigger was a specific incident: OWM reporte
 **Problem:** If the agent evaluated at minute 0 and the user sent a message at minute 1, the message would be active for almost 6 evaluation cycles (119 minutes). That's 5 extra cycles where the LLM is still trying to follow a stale instruction.
 
 **After:** Messages expire after 2 evaluation cycles regardless of clock time. This means a message is active for exactly 2 decisions (the immediate response + one follow-up), then the agent returns to autonomous mode.
+
+### Adding Presence Detection After Scoping It Out
+
+**What happened:** I originally scoped out occupancy detection — "our schedule is predictable enough." That was true for daily patterns (sleep/wake/work). But when planning a week-long vacation, I realized the agent would keep the house at 75-80F the entire time, cooling an empty house in 100F heat. The system had no concept of "nobody is home for days."
+
+**What I did:** Instead of buying motion sensors or integrating with a smart home hub, I used OwnTracks — a free app that publishes phone GPS over MQTT. Both phones report to a local Mosquitto broker. When both phones are >30 miles from home, vacation mode widens the comfort range to 65-85F and slows evaluations to every 60 minutes.
+
+**The infrastructure was the hard part, not the code.** The location module was ~200 lines of Python. Getting it to work from anywhere required: Mosquitto as a Windows service, port forwarding on the AT&T gateway, and DuckDNS for dynamic IP resolution. Each step had its own friction (Mosquitto defaulting to localhost-only, ARM/x64 binary mismatch for password hashing, AT&T's NAT/Gaming UI). The code shipped in an hour. The infrastructure took a session of iterative debugging.
+
+**PM lesson:** "Not now" is a better scoping decision than "never." The original scoping was correct at the time — occupancy detection for daily patterns wasn't worth the complexity. But requirements change as you use the product. The trick is recognizing when a scoped-out feature becomes the obvious next thing.
 
 ### False Manual Override Detections
 
@@ -273,7 +314,7 @@ Three features that turned out to be essential:
 | Safety incidents | 0 |
 | JSON parse failures in production | 0 |
 | QA bugs found and fixed | 4 (all on day 1, all with regression tests) |
-| Unit tests | 49 (all passing) |
+| Unit tests | 94 (all passing) |
 | Benchmark test scenarios | 59 scenarios, 118 checks |
 | Model accuracy (Gemma 4 E2B) | 94.9% acceptable |
 | Cloud AI cost | $0.00 |
@@ -296,9 +337,9 @@ Three features that turned out to be essential:
 ## Architecture (One Picture)
 
 ```
-User (Telegram)
-    │
-    ▼
+User (Telegram)          Phones (OwnTracks)
+    │                         │
+    ▼                         ▼
 ┌─────────────────────────────────────────────────┐
 │              AGENT CORE (Python)                │
 │                                                  │
@@ -309,14 +350,16 @@ User (Telegram)
 │  └────┬─────┘  └──────────┘  └───────────────┘ │
 │       │                                          │
 │       ▼                                          │
-│  ┌──────────┐                                   │
-│  │ Local LLM│  Gemma 4 E2B via llama.cpp       │
-│  │ (on GPU) │  Starts per cycle, stops after    │
-│  └──────────┘                                   │
+│  ┌──────────┐  ┌──────────┐                     │
+│  │ Local LLM│  │ Location │  OwnTracks → MQTT  │
+│  │ (on GPU) │  │ (vacation│  → Mosquitto broker │
+│  └──────────┘  │  mode)   │  → DuckDNS DDNS    │
+│                └──────────┘                     │
 │                                                  │
 │  Data Sources:                                  │
 │  ├── Nest SDM API (indoor temp, humidity, mode) │
 │  ├── Open-Meteo (forecast, daily high/low)      │
+│  ├── OwnTracks/MQTT (phone GPS, vacation mode)  │
 │  ├── SQLite (decisions, messages, climate log)  │
 │  └── Telegram (user messages)                   │
 └─────────────────────────────────────────────────┘

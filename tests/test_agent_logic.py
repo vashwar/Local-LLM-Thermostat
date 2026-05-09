@@ -18,6 +18,7 @@ sys.modules["telegram.error"] = MagicMock()
 sys.modules["telegram.ext"] = MagicMock()
 
 import agent
+import location
 from nest_api import ThermostatState
 
 
@@ -692,3 +693,108 @@ class TestCheckAndSwitchMode:
         msg = mock_tg.call_args[0][0]
         assert "HEAT" in msg
         assert "68" in msg  # New target mentioned
+
+
+# ── Vacation Mode Directive Tests ────────────────────────────────
+
+class TestVacationModeDirective:
+    """Tests for vacation mode integration in agent.py."""
+
+    @pytest.fixture(autouse=True)
+    def reset_vacation(self):
+        """Reset location module state before each test."""
+        location._vacation_mode = False
+        location._enabled = False
+        location._initialized = False
+        location._vacation_temp_min = 65
+        location._vacation_temp_max = 85
+        yield
+        location._vacation_mode = False
+
+    def test_vacation_directive_overrides_normal(self):
+        """When vacation mode is active, directive should contain VACATION MODE and 65-85F."""
+        location._vacation_mode = True
+        state = _make_thermo_state(mode="cooling", indoor_temp=76.0)
+        now = datetime(2025, 7, 15, 14, 0)
+        comfort = agent._config["comfort"]
+        sched = agent._config["schedule"]
+
+        with patch("agent.weather") as mock_weather:
+            mock_weather.get_forecast_analysis.return_value = None
+            directive, is_user = agent._build_directive(
+                state, MagicMock(current_temp=95.0), now, comfort, sched, [])
+
+        assert "VACATION MODE" in directive
+        assert "65-85F" in directive
+        assert is_user is False
+
+    def test_vacation_widens_guardrails_to_85(self):
+        """In vacation mode, get_temp_max() should return 85 (not 80)."""
+        location._vacation_mode = True
+        assert agent.get_temp_max() == 85
+
+    def test_normal_guardrails_unchanged_at_80(self):
+        """Outside vacation mode, get_temp_max() should return 80."""
+        location._vacation_mode = False
+        assert agent.get_temp_max() == 80
+
+    def test_vacation_get_temp_min(self):
+        """In vacation mode, get_temp_min() should return vacation min (65)."""
+        location._vacation_mode = True
+        assert agent.get_temp_min() == 65
+
+    def test_normal_get_temp_min(self):
+        """Outside vacation mode, get_temp_min() returns normal min (65)."""
+        location._vacation_mode = False
+        assert agent.get_temp_min() == 65
+
+    def test_user_message_takes_precedence_over_vacation(self):
+        """Path A (user message) should take precedence over vacation directive."""
+        location._vacation_mode = True
+        # Activate user message
+        agent._evaluation_counter = 10
+        agent._user_message_eval_counter = 10
+
+        state = _make_thermo_state(name="Upstairs", mode="cooling", indoor_temp=76.0)
+        now = datetime(2025, 7, 15, 14, 0)
+        comfort = agent._config["comfort"]
+        sched = agent._config["schedule"]
+
+        utc_now = datetime.now(timezone.utc)
+        ts = (utc_now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        messages = [{"text": "set bedroom to 72", "timestamp": ts}]
+
+        with patch("agent.weather") as mock_weather:
+            mock_weather.get_forecast_analysis.return_value = None
+            directive, is_user = agent._build_directive(
+                state, MagicMock(current_temp=95.0), now, comfort, sched, messages)
+
+        # Should be Path A (user message), not vacation
+        assert "VACATION MODE" not in directive
+        assert "RULE 1:" in directive
+        assert "set bedroom to 72" in directive
+        assert is_user is True
+
+    def test_guardrail_clamp_uses_vacation_range(self):
+        """During vacation, guardrails should clamp to 85 (not 80)."""
+        location._vacation_mode = True
+        with patch("agent.database") as mock_db:
+            mock_db.count_temp_changes_last_hour.return_value = 0
+            mock_db.get_last_manual_override_time.return_value = None
+            decision = {"action": "set_temperature", "temperature": 90,
+                        "reasoning": "test"}
+            allowed, reason = agent.check_guardrails(decision)
+            assert allowed is True
+            assert decision["temperature"] == 85  # clamped to vacation max, not 80
+
+    def test_guardrail_clamp_normal_at_80(self):
+        """Outside vacation, guardrails should clamp to 80."""
+        location._vacation_mode = False
+        with patch("agent.database") as mock_db:
+            mock_db.count_temp_changes_last_hour.return_value = 0
+            mock_db.get_last_manual_override_time.return_value = None
+            decision = {"action": "set_temperature", "temperature": 90,
+                        "reasoning": "test"}
+            allowed, reason = agent.check_guardrails(decision)
+            assert allowed is True
+            assert decision["temperature"] == 80

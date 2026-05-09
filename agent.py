@@ -22,6 +22,7 @@ if __name__ == "__main__":
     sys.modules["agent"] = sys.modules[__name__]
 
 import database
+import location
 import weather
 import nest_api
 import llm_server
@@ -29,12 +30,27 @@ import llm_server
 logger = logging.getLogger(__name__)
 
 # ── Hard-coded guardrails (not configurable) ──────────────────────
-TEMP_MIN = 65
-TEMP_MAX = 80
+TEMP_MIN_NORMAL = 65
+TEMP_MAX_NORMAL = 80
 MAX_CHANGES_PER_HOUR = 6
 MANUAL_OVERRIDE_BACKOFF_MINUTES = 120
 USER_REQUEST_BACKOFF_MINUTES = 40
 MODE_TRANSITION_GAP_MINUTES = 5
+
+
+def get_temp_min() -> int:
+    """Return the current minimum guardrail temperature (wider in vacation mode)."""
+    if location.is_vacation_mode():
+        return location.get_vacation_temp_min()
+    return TEMP_MIN_NORMAL
+
+
+def get_temp_max() -> int:
+    """Return the current maximum guardrail temperature (wider in vacation mode)."""
+    if location.is_vacation_mode():
+        return location.get_vacation_temp_max()
+    return TEMP_MAX_NORMAL
+
 
 # ── System prompt — compact for Qwen 4B ──────────────────────────
 SYSTEM_PROMPT = """You are a thermostat agent for the {zone_name} zone.
@@ -221,8 +237,8 @@ def build_context(thermo_state, weather_data, all_states=None) -> str:
         state="\n".join(state_lines),
         directive=directive,
         user_messages=user_msg_section,
-        temp_min=TEMP_MIN,
-        temp_max=TEMP_MAX,
+        temp_min=get_temp_min(),
+        temp_max=get_temp_max(),
     )
 
 
@@ -329,6 +345,16 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
         return "DIRECTIVE:\n" + "".join(parts), True
 
 
+    # ── Path V: Vacation mode → energy-saving directive (between A and B) ──
+    if location.is_vacation_mode():
+        vmin = location.get_vacation_temp_min()
+        vmax = location.get_vacation_temp_max()
+        parts = [
+            f"VACATION MODE ACTIVE. Maintain {vmin}-{vmax}F. Prefer no_change.",
+            f"Indoor is {indoor}F. Only act if outside {vmin}-{vmax}F range.",
+        ]
+        return "DIRECTIVE: " + " ".join(parts), False
+
     # ── Path B: No user message → Python provides context, energy-saving bias ──
 
     # Sleep time logic (proven, keep as-is)
@@ -343,7 +369,7 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
             else:
                 parts.append(f"Sleep time, summer. Outdoor is mild ({outdoor}F). Let the house coast — prefer no_change.")
         else:  # heating
-            if indoor >= TEMP_MIN + 2:
+            if indoor >= get_temp_min() + 2:
                 parts.append(f"Sleep time, winter. Indoor {indoor}F is fine. Let it drift — prefer no_change.")
             else:
                 parts.append(f"Sleep time, winter. Indoor {indoor}F is getting cold. Heat to {comfort_low}F.")
@@ -427,8 +453,8 @@ def check_guardrails(decision: dict, user_triggered: bool = False) -> Tuple[bool
     temp = decision.get("temperature")
 
     # Temperature bounds — clamp instead of block
-    if temp is not None and not (TEMP_MIN <= temp <= TEMP_MAX):
-        clamped = max(TEMP_MIN, min(TEMP_MAX, temp))
+    if temp is not None and not (get_temp_min() <= temp <= get_temp_max()):
+        clamped = max(get_temp_min(), min(get_temp_max(), temp))
         logger.warning("Guardrail clamp: LLM requested %sF, clamped to %sF", temp, clamped)
         decision["temperature"] = clamped
         decision["reasoning"] = f"[Clamped {temp}F->{clamped}F] " + decision.get("reasoning", "")
@@ -765,9 +791,9 @@ async def agent_loop():
     """
     global _last_evaluation_result, _evaluation_counter, _user_triggered
 
-    interval_seconds = _config["agent"]["loop_interval_minutes"] * 60
+    normal_interval = _config["agent"]["loop_interval_minutes"] * 60
 
-    logger.info("Agent loop starting (interval: %d minutes)", interval_seconds // 60)
+    logger.info("Agent loop starting (normal interval: %d minutes)", normal_interval // 60)
 
     # Wait for Telegram bot to register its send function
     logger.info("Waiting for Telegram bot to initialize...")
@@ -819,6 +845,13 @@ async def agent_loop():
             logger.info("Trigger received during cycle — running again immediately")
             continue
 
+        # Compute interval: longer during vacation mode to save energy
+        if location.is_vacation_mode():
+            interval_seconds = location.get_vacation_eval_interval_minutes() * 60
+        else:
+            interval_seconds = normal_interval
+        logger.debug("Next evaluation in %d minutes", interval_seconds // 60)
+
         # Wait for next interval, checking for triggers every 2 seconds
         waited = 0
         while waited < interval_seconds:
@@ -837,6 +870,22 @@ def get_last_evaluation_result() -> Optional[dict]:
 def get_evaluation_counter() -> int:
     """Get the evaluation counter (for detecting new cycles)."""
     return _evaluation_counter
+
+
+async def _on_vacation_mode_change(is_vacation: bool):
+    """Callback fired by location module when vacation mode transitions."""
+    if is_vacation:
+        vmin = location.get_vacation_temp_min()
+        vmax = location.get_vacation_temp_max()
+        msg = (f"Vacation mode ACTIVATED — all phones are away.\n"
+               f"Widening comfort range to {vmin}-{vmax}F, "
+               f"eval interval → {location.get_vacation_eval_interval_minutes()} min.")
+    else:
+        msg = (f"Vacation mode DEACTIVATED — welcome home!\n"
+               f"Restoring normal comfort range ({TEMP_MIN_NORMAL}-{TEMP_MAX_NORMAL}F), "
+               f"eval interval → {_config['agent']['loop_interval_minutes']} min.")
+    logger.info(msg)
+    await send_telegram(msg)
 
 
 async def main():
@@ -875,17 +924,25 @@ async def main():
         port=llm_port
     )
 
+    # Init location tracking (OwnTracks)
+    location.init_location(config)
+    location.set_vacation_change_callback(_on_vacation_mode_change)
+
     # Init Telegram bot (imported here to avoid circular imports)
     import telegram_bot
     telegram_bot.init_bot(config)
 
     logger.info("All modules initialized. Starting agent loop + Telegram bot.")
 
-    # Run agent loop and Telegram bot concurrently
-    await asyncio.gather(
+    # Run agent loop, Telegram bot, and MQTT location loop concurrently
+    tasks = [
         agent_loop(),
-        telegram_bot.start_bot()
-    )
+        telegram_bot.start_bot(),
+    ]
+    if config.get("owntracks", {}).get("enabled", False):
+        tasks.append(location.mqtt_loop())
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
