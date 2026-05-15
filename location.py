@@ -25,7 +25,7 @@ _broker_pass: Optional[str] = None
 _topics: list = []
 _geofence_miles: float = 30.0
 _stale_hours: float = 12.0
-_vacation_temp_min: int = 65
+_vacation_temp_min: int = 60
 _vacation_temp_max: int = 85
 _vacation_eval_interval_minutes: int = 60
 
@@ -72,7 +72,7 @@ def init_location(config: dict):
     _topics = ot.get("topics", [])
     _geofence_miles = ot.get("geofence_miles", 30.0)
     _stale_hours = ot.get("stale_hours", 12.0)
-    _vacation_temp_min = ot.get("vacation_temp_min", 65)
+    _vacation_temp_min = ot.get("vacation_temp_min", 60)
     _vacation_temp_max = ot.get("vacation_temp_max", 85)
     _vacation_eval_interval_minutes = ot.get("vacation_eval_interval_minutes", 60)
 

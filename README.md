@@ -39,7 +39,8 @@ When you send a Telegram message, the agent immediately runs an extra evaluation
 - **On-demand LLM** — llama-server starts only during evaluations, then shuts down to free GPU memory
 - **Telegram bot** — send natural language commands ("set upstairs to 78"), get status, export data
 - **User requests are priority** — the AI always follows your explicit instructions over its own logic
-- **Safety guardrails** — hard-coded temp bounds (65-80F), rate limiting, manual override detection
+- **Vacation mode** — OwnTracks presence detection via MQTT; sets 85F (cool) / 60F (heat) when everyone is away
+- **Safety guardrails** — hard-coded temp bounds (65-80F normal, 60-85F vacation), rate limiting, manual override detection
 - **Weather-aware** — Open-Meteo primary (true daily high/low, hourly resolution), OWM fallback
 - **Schedule-aware** — knows sleep/wake times, adjusts comfort ranges by season and HVAC mode
 - **SLM-optimized** — Python pre-processes all reasoning into a ~200-token prompt, respecting the 4096 context window
@@ -257,8 +258,8 @@ These are hard-coded and cannot be overridden by the AI:
 
 | Guardrail | Value |
 |-----------|-------|
-| Minimum temperature | 65F |
-| Maximum temperature | 80F |
+| Minimum temperature | 65F (60F in vacation mode) |
+| Maximum temperature | 80F (85F in vacation mode) |
 | Max changes per hour | 6 |
 | Manual override backoff | 120 minutes |
 
@@ -275,6 +276,7 @@ AIThermostat/
 ├── nest_api.py        # Nest SDM API wrapper — read state, set temperature
 ├── weather.py         # Weather client — Open-Meteo primary, OWM fallback
 ├── database.py        # SQLite logging — climate, decisions, messages, errors
+├── location.py        # OwnTracks presence detection, vacation mode logic
 ├── llm_server.py      # On-demand llama-server lifecycle manager
 ├── nest_setup.py      # One-time setup script for Nest API tokens
 ├── test_qwen_4b.py    # LLM reliability test (18 scenarios)
@@ -283,7 +285,7 @@ AIThermostat/
 ├── start.bat          # Windows startup script
 ├── PRODUCT.md         # Product decisions, pivots, and learnings
 ├── ARCHITECTURE.md    # System architecture and component details
-├── tests/             # 49 unit tests (pytest)
+├── tests/             # 95 unit tests (pytest)
 ├── DesignDOC/         # Original design document
 └── thermostat.db      # SQLite database (created on first run)
 ```

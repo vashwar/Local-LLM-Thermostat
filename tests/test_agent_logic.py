@@ -706,13 +706,13 @@ class TestVacationModeDirective:
         location._vacation_mode = False
         location._enabled = False
         location._initialized = False
-        location._vacation_temp_min = 65
+        location._vacation_temp_min = 60
         location._vacation_temp_max = 85
         yield
         location._vacation_mode = False
 
-    def test_vacation_directive_overrides_normal(self):
-        """When vacation mode is active, directive should contain VACATION MODE and 65-85F."""
+    def test_vacation_directive_cool_targets_85(self):
+        """In cooling mode, vacation directive should target 85F (cool ceiling)."""
         location._vacation_mode = True
         state = _make_thermo_state(mode="cooling", indoor_temp=76.0)
         now = datetime(2025, 7, 15, 14, 0)
@@ -725,7 +725,26 @@ class TestVacationModeDirective:
                 state, MagicMock(current_temp=95.0), now, comfort, sched, [])
 
         assert "VACATION MODE" in directive
-        assert "65-85F" in directive
+        assert "85F" in directive
+        assert "cool ceiling" in directive
+        assert is_user is False
+
+    def test_vacation_directive_heat_targets_60(self):
+        """In heating mode, vacation directive should target 60F (heat floor)."""
+        location._vacation_mode = True
+        state = _make_thermo_state(mode="heating", indoor_temp=55.0)
+        now = datetime(2025, 1, 15, 14, 0)
+        comfort = agent._config["comfort"]
+        sched = agent._config["schedule"]
+
+        with patch("agent.weather") as mock_weather:
+            mock_weather.get_forecast_analysis.return_value = None
+            directive, is_user = agent._build_directive(
+                state, MagicMock(current_temp=30.0), now, comfort, sched, [])
+
+        assert "VACATION MODE" in directive
+        assert "60F" in directive
+        assert "heat floor" in directive
         assert is_user is False
 
     def test_vacation_widens_guardrails_to_85(self):
@@ -739,9 +758,9 @@ class TestVacationModeDirective:
         assert agent.get_temp_max() == 80
 
     def test_vacation_get_temp_min(self):
-        """In vacation mode, get_temp_min() should return vacation min (65)."""
+        """In vacation mode, get_temp_min() should return vacation min (60)."""
         location._vacation_mode = True
-        assert agent.get_temp_min() == 65
+        assert agent.get_temp_min() == 60
 
     def test_normal_get_temp_min(self):
         """Outside vacation mode, get_temp_min() returns normal min (65)."""

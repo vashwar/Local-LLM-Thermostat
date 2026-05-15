@@ -349,10 +349,18 @@ def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) 
     if location.is_vacation_mode():
         vmin = location.get_vacation_temp_min()
         vmax = location.get_vacation_temp_max()
-        parts = [
-            f"VACATION MODE ACTIVE. Maintain {vmin}-{vmax}F. Prefer no_change.",
-            f"Indoor is {indoor}F. Only act if outside {vmin}-{vmax}F range.",
-        ]
+        if mode == "heating":
+            target = vmin
+            parts = [
+                f"VACATION MODE ACTIVE. Target {target}F (heat floor).",
+                f"Indoor is {indoor}F. Only heat if below {target}F, otherwise no_change.",
+            ]
+        else:
+            target = vmax
+            parts = [
+                f"VACATION MODE ACTIVE. Target {target}F (cool ceiling).",
+                f"Indoor is {indoor}F. Only cool if above {target}F, otherwise no_change.",
+            ]
         return "DIRECTIVE: " + " ".join(parts), False
 
     # ── Path B: No user message → Python provides context, energy-saving bias ──

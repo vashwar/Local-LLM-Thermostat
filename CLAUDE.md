@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Status
 
 - **Weather module**: Switched to Open-Meteo primary (free, no key, true daily high/low), OWM fallback
-- **All tests passing**: 46/46 unit tests in `tests/test_agent_logic.py`
+- **All tests passing**: 95 unit tests across `tests/test_agent_logic.py`, `tests/test_location.py`, `tests/test_database.py`
+- **Vacation mode**: Mode-aware targets — 85F (cool), 60F (heat); guardrails widen to 60-85F
 - **Do NOT push**: `testHarness/` folder (added to `.gitignore`)
 
 ## gstack
