@@ -102,33 +102,28 @@ class TestVacationLogic:
         location._evaluate_vacation_mode()
         assert location.is_vacation_mode() is False
 
-    def test_stale_phone_not_counted_as_away(self):
-        """A stale phone should not count as 'away' to trigger vacation."""
-        # One phone far away (fresh), one phone far away but stale (>12h)
+    def test_stale_phone_counts_as_home(self):
+        """A stale phone counts as 'home' — safer default prevents false vacation."""
+        # One phone far away (fresh), one phone stale
         self._place_phone("owntracks/vash/phone", 37.7749, -122.4194)
         self._place_phone("owntracks/wife/phone", 37.7749, -122.4194,
                          age_seconds=13 * 3600)  # 13 hours old
 
         location._evaluate_vacation_mode()
-        # Only 1 non-stale phone away, 1 stale — should NOT activate
-        # (stale phone doesn't count as home either, but we need ALL phones away)
-        # Actually: phones_away=1, phones_home=0, phones_stale=1
-        # The logic says: phones_away > 0 and phones_home == 0 → vacation ON
-        # This is correct — the stale phone is ignored, the one fresh phone is away.
-        # But the plan says "stale phone not counted as away" meaning if only
-        # stale phones are "away", vacation should not activate.
-        # Let's test the case where the ONLY "away" data is stale.
+        # Stale phone counts as home → vacation stays OFF
+        assert location.is_vacation_mode() is False
 
-    def test_all_stale_keeps_current_state(self):
-        """When all phones are stale, keep current state (don't flip)."""
-        # Start with vacation OFF, all stale
+    def test_all_stale_turns_vacation_off(self):
+        """When all phones are stale, they count as home → vacation OFF."""
+        # Start with vacation ON, all go stale
+        location._vacation_mode = True
         self._place_phone("owntracks/vash/phone", 37.7749, -122.4194,
                          age_seconds=13 * 3600)
         self._place_phone("owntracks/wife/phone", 37.7749, -122.4194,
                          age_seconds=13 * 3600)
 
         location._evaluate_vacation_mode()
-        assert location.is_vacation_mode() is False  # stays OFF
+        assert location.is_vacation_mode() is False  # stale = home, so vacation OFF
 
     def test_no_data_stays_off(self):
         """No phone data at all → vacation stays OFF (fail-safe)."""

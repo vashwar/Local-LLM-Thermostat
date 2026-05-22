@@ -182,6 +182,7 @@ def _evaluate_vacation_mode():
 
         if age > stale_threshold:
             phones_stale += 1
+            phones_home += 1  # Stale = assume home (safer default)
             continue
 
         if loc["miles_from_home"] > _geofence_miles:
@@ -189,12 +190,8 @@ def _evaluate_vacation_mode():
         else:
             phones_home += 1
 
-    # Fail-safe: if no phone has fresh data, vacation stays OFF (never activates on missing data)
-    if phones_with_data == 0 or (phones_away == 0 and phones_home == 0):
-        # All stale or no data — keep current state, but don't activate
-        if not _vacation_mode:
-            return
-        # If already in vacation and all go stale, keep current (don't flip on stale)
+    # Fail-safe: if no phone has any data at all, vacation stays OFF
+    if phones_with_data == 0:
         return
 
     old_mode = _vacation_mode
