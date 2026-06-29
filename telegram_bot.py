@@ -102,12 +102,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Vacation mode status
         if location.is_vacation_mode():
             lines.append("\nVACATION MODE: ACTIVE")
-        phones = location.get_phone_locations()
-        if phones:
-            lines.append("\nPhone locations:")
-            for topic, info in phones.items():
-                name = topic.split("/")[-2] if "/" in topic else topic
-                lines.append(f"  {name}: {info['miles_from_home']:.1f} mi from home")
+        elif location._enabled:
+            lines.append(f"\nPresence: {len(location._phone_macs)} phone(s) monitored")
 
         if last_result:
             lines.append("")
@@ -182,11 +178,22 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /vacation command — show vacation mode status and phone distances."""
+    """Handle /vacation command — show status, or /vacation on|off to override."""
     if not _is_authorized(update.effective_chat.id):
         return
 
     try:
+        args = context.args
+        if args and args[0].lower() == "off":
+            location._vacation_mode = False
+            location._consecutive_misses = 0
+            await _safe_reply(update.message, "Vacation mode turned OFF. Miss counter reset.")
+            return
+        elif args and args[0].lower() == "on":
+            location._vacation_mode = True
+            await _safe_reply(update.message, "Vacation mode turned ON manually.")
+            return
+
         lines = ["Vacation Mode Status", "=" * 25]
 
         if location.is_vacation_mode():
@@ -197,17 +204,15 @@ async def cmd_vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("Status: OFF")
             lines.append(f"Normal guardrails: {agent.TEMP_MIN_NORMAL}-{agent.TEMP_MAX_NORMAL}F")
 
-        phones = location.get_phone_locations()
-        if phones:
-            lines.append(f"\nGeofence: {location._geofence_miles:.0f} mi")
-            lines.append("Phones:")
-            for topic, info in phones.items():
-                name = topic.split("/")[-2] if "/" in topic else topic
-                dist = info["miles_from_home"]
-                status = "AWAY" if dist > location._geofence_miles else "HOME"
-                lines.append(f"  {name}: {dist:.1f} mi ({status})")
+        if location._enabled:
+            misses = location._consecutive_misses
+            required = location._required_misses
+            lines.append(f"\nARP presence: {len(location._phone_macs)} MAC(s) monitored")
+            lines.append(f"Consecutive misses: {misses}/{required}")
         else:
-            lines.append("\nNo phone location data yet.")
+            lines.append("\nPresence detection disabled.")
+
+        lines.append("\nCommands: /vacation on | /vacation off")
 
         await _safe_reply(update.message, "\n".join(lines))
 
@@ -235,9 +240,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Acknowledge receipt
     await _safe_reply(update.message,"Got it. Running evaluation...")
 
-    # Record current counter, then trigger
+    # Record current counter, then trigger with user text
     old_counter = agent.get_evaluation_counter()
-    agent.trigger_evaluation()
+    agent.trigger_evaluation(user_text=text)
 
     # Wait for a NEW cycle to complete (up to 3 minutes)
     result = None

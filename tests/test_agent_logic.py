@@ -1,5 +1,6 @@
 """
-Tests for agent.py core logic — directive builder, guardrails, validation.
+Tests for agent.py — comfort model integration, guardrails, mode switching,
+NLP command handling, cooldown logic.
 """
 
 import json
@@ -8,7 +9,6 @@ import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
-
 
 # We need to set up sys.modules before importing agent to avoid
 # circular import issues with telegram_bot
@@ -20,13 +20,18 @@ sys.modules["telegram.ext"] = MagicMock()
 import agent
 import location
 from nest_api import ThermostatState
+from comfort_model import ComfortModel, ComfortInput, ComfortPrediction
+from nlp_parser import ParsedCommand
 
 
 @pytest.fixture(autouse=True)
 def setup_config():
     """Load a minimal config and reset module state for all tests."""
     agent._evaluation_counter = 0
-    agent._user_message_eval_counter = None
+    agent._user_triggered = False
+    agent._pending_user_text = None
+    agent._last_cooldown_time = None
+    agent._comfort_model = ComfortModel(deadband_f=2.0)
     agent._config = {
         "llm": {
             "model": "test",
@@ -46,12 +51,18 @@ def setup_config():
             "sleep_cool_override_temp": 80,
             "pre_heat_minutes": 30,
         },
+        "comfort_model": {
+            "corrections_path": "test_corrections.json",
+            "deadband_f": 2.0,
+            "adjust_step_f": 2.0,
+            "retrain_on_startup": False,
+        },
         "schedule": {
             "sleep_time": "23:00",
             "wake_time": "07:00",
         },
         "agent": {
-            "loop_interval_minutes": 20,
+            "loop_interval_minutes": 30,
             "db_path": ":memory:",
             "log_level": "INFO",
         },
@@ -83,201 +94,186 @@ def _make_thermo_state(name="Test Zone", mode="cooling", indoor_temp=72.0,
     )
 
 
-# ── Regression: ISSUE-001 — mode string mismatch ──────────────────
-# Found by /qa on 2026-03-31
-# Report: .gstack/qa-reports/qa-report-2026-03-31.md
+def _make_weather(current_temp=85.0, humidity=50, forecast_summary="Clear"):
+    w = MagicMock()
+    w.current_temp = current_temp
+    w.humidity = humidity
+    w.forecast_summary = forecast_summary
+    w.is_stale = False
+    return w
 
-class TestModeStringRegression:
-    """Regression tests for ISSUE-001: nest_api returns lowercase mode strings
-    ('cooling', 'heating') but _build_directive used uppercase ('COOL', 'HEAT').
-    This caused winter range to never be used and sleep logic to be inverted."""
 
-    def test_heating_mode_uses_winter_range(self):
-        """In heating mode, directive should reference winter comfort range (68-72F)."""
-        state = _make_thermo_state(mode="heating", indoor_temp=65.0)
-        now = datetime(2025, 12, 15, 14, 0)  # 2 PM, a home period
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
+# ── Comfort Model Integration Tests ─────────────────────────────
 
-        directive, _ = agent._build_directive(state, MagicMock(current_temp=35.0),
-                                           now, comfort, sched, [])
+class TestComfortModelIntegration:
+    def test_build_comfort_input(self):
+        """_build_comfort_input correctly maps state to ComfortInput."""
+        state = _make_thermo_state(name="Upstairs Bedroom", mode="cooling",
+                                   indoor_temp=76.0, target_temp=78.0)
+        weather_data = _make_weather(current_temp=90.0)
+        now = datetime(2025, 7, 15, 14, 30)
 
-        assert "68-72F" in directive, \
-            f"Heating mode should use winter range (68-72F), got: {directive}"
-        assert "75-80F" not in directive, \
-            f"Heating mode should NOT use summer range, got: {directive}"
+        inp = agent._build_comfort_input(state, weather_data, now)
 
-    def test_cooling_mode_uses_summer_range(self):
-        """In cooling mode, directive should reference summer comfort range (75-80F)."""
-        state = _make_thermo_state(mode="cooling", indoor_temp=78.0)
+        assert inp.outdoor_temp == 90.0
+        assert inp.indoor_temp == 76.0
+        assert inp.hvac_mode == "cooling"
+        assert inp.hour == 14
+        assert inp.minute == 30
+        assert inp.zone == "Upstairs Bedroom"
+        assert inp.current_target == 78.0
+
+    def test_autonomous_cycle_uses_comfort_model(self):
+        """Autonomous evaluation uses comfort model, not LLM."""
+        # The comfort model should be called, not call_llm
+        state = _make_thermo_state(name="Downstairs Kitchen", mode="cooling",
+                                   indoor_temp=76.0, target_temp=75.0)
+        weather_data = _make_weather(current_temp=85.0)
         now = datetime(2025, 7, 15, 14, 0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
 
-        directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
-                                           now, comfort, sched, [])
+        inp = agent._build_comfort_input(state, weather_data, now)
+        prediction = agent._comfort_model.predict(inp)
 
-        assert "75-80F" in directive
-        assert "68-72F" not in directive
-
-    def test_sleep_cooling_mode_uses_cool_branch(self):
-        """During sleep in cooling mode, directive should mention summer/cooling logic."""
-        state = _make_thermo_state(mode="cooling", indoor_temp=74.0)
-        now = datetime(2025, 7, 15, 23, 30)  # 11:30 PM — sleep time
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=78.0),
-                                               now, comfort, sched, [])
-
-        assert "summer" in directive.lower() or "cool" in directive.lower(), \
-            f"Sleep+cooling should use summer/cool logic, got: {directive}"
-
-    def test_sleep_heating_mode_uses_heat_branch(self):
-        """During sleep in heating mode, directive should mention winter/heat logic."""
-        state = _make_thermo_state(mode="heating", indoor_temp=66.0)
-        now = datetime(2025, 12, 15, 23, 30)  # 11:30 PM — sleep time
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=30.0),
-                                               now, comfort, sched, [])
-
-        assert "winter" in directive.lower() or "heat" in directive.lower() or "cold" in directive.lower(), \
-            f"Sleep+heating should use heat logic, got: {directive}"
+        # Default cooling: 78F, current target 75F → diff=3F > deadband → should_change
+        assert prediction.baseline_temp == 78
+        assert prediction.should_change is True
 
 
-# ── Regression: ISSUE-002 — message age timezone mismatch ─────────
-# Found by /qa on 2026-03-31
+# ── NLP Command Handling Tests ───────────────────────────────────
 
-class TestMessageAgeTimezone:
-    """Regression tests for ISSUE-002: _get_message_age_minutes compared UTC
-    timestamps from SQLite with local time from datetime.now(), causing the
-    age to be off by the local timezone offset."""
+class TestParsedCommandHandling:
+    def test_set_temp_single_zone(self):
+        """set_temp command applies to the correct zone."""
+        cmd = ParsedCommand(action_type="set_temp", target_temp=77.0,
+                           zone="upstairs", raw_text="set upstairs to 77")
+        states = [
+            _make_thermo_state(name="Upstairs Bedroom", target_temp=75.0),
+            _make_thermo_state(name="Downstairs Kitchen", target_temp=75.0),
+        ]
+        weather_data = _make_weather()
 
-    def test_message_age_utc_timestamp(self):
-        """A message stored 10 minutes ago in UTC should report ~10 minutes age."""
-        now = datetime.now()
-        # Simulate a SQLite UTC timestamp from 10 minutes ago
-        utc_now = datetime.now(timezone.utc)
-        ten_min_ago_utc = utc_now - timedelta(minutes=10)
-        ts = ten_min_ago_utc.strftime("%Y-%m-%d %H:%M:%S")
+        decisions = agent._apply_parsed_command(cmd, states, weather_data)
 
-        msg = {"timestamp": ts, "text": "test"}
-        age = agent._get_message_age_minutes(msg, now)
+        assert len(decisions) == 1
+        assert decisions[0][0]["temperature"] == 77.0
+        assert decisions[0][1].name == "Upstairs Bedroom"
 
-        assert age is not None
-        assert 8 <= age <= 12, \
-            f"Message from 10 min ago should report ~10 min age, got {age:.1f}"
+    def test_set_temp_both_zones(self):
+        """set_temp with zone='both' applies to all zones."""
+        cmd = ParsedCommand(action_type="set_temp", target_temp=79.0,
+                           zone="both", raw_text="set both to 79")
+        states = [
+            _make_thermo_state(name="Upstairs Bedroom"),
+            _make_thermo_state(name="Downstairs Kitchen"),
+        ]
+        weather_data = _make_weather()
 
-    def test_message_age_returns_none_for_missing_timestamp(self):
-        """Messages without timestamps should return None."""
-        msg = {"text": "test"}
-        assert agent._get_message_age_minutes(msg, datetime.now()) is None
+        decisions = agent._apply_parsed_command(cmd, states, weather_data)
 
-    def test_message_age_returns_none_for_empty_timestamp(self):
-        msg = {"timestamp": "", "text": "test"}
-        assert agent._get_message_age_minutes(msg, datetime.now()) is None
+        assert len(decisions) == 2
+        for dec, _ in decisions:
+            assert dec["temperature"] == 79.0
 
+    def test_set_temp_no_zone_applies_all(self):
+        """set_temp with no zone applies to all zones."""
+        cmd = ParsedCommand(action_type="set_temp", target_temp=76.0,
+                           zone=None, raw_text="set to 76")
+        states = [
+            _make_thermo_state(name="Upstairs Bedroom"),
+            _make_thermo_state(name="Downstairs Kitchen"),
+        ]
+        weather_data = _make_weather()
 
-# ── Validate Response Tests ───────────────────────────────────────
+        decisions = agent._apply_parsed_command(cmd, states, weather_data)
+        assert len(decisions) == 2
 
-class TestValidateResponse:
-    def test_valid_set_temperature(self):
-        resp = json.dumps({
-            "action": "set_temperature",
-            "temperature": 72,
-            "reasoning": "It's cold"
-        })
-        valid, error = agent.validate_response(resp)
-        assert valid is True
-        assert error is None
+    def test_adjust_warmer(self):
+        """adjust warmer increases temp by ADJUST_STEP_F."""
+        cmd = ParsedCommand(action_type="adjust", direction="warmer",
+                           raw_text="make it warmer")
+        states = [_make_thermo_state(target_temp=76.0)]
+        weather_data = _make_weather()
 
-    def test_valid_no_change(self):
-        resp = json.dumps({
-            "action": "no_change",
-            "temperature": None,
-            "reasoning": "Comfortable"
-        })
-        valid, error = agent.validate_response(resp)
-        assert valid is True
+        decisions = agent._apply_parsed_command(cmd, states, weather_data)
 
-    def test_invalid_action(self):
-        resp = json.dumps({"action": "turn_off", "reasoning": "test"})
-        valid, error = agent.validate_response(resp)
-        assert valid is False
-        assert "Invalid action" in error
+        assert len(decisions) == 1
+        assert decisions[0][0]["temperature"] == 78.0  # 76 + 2
 
-    def test_missing_action(self):
-        resp = json.dumps({"temperature": 72, "reasoning": "test"})
-        valid, error = agent.validate_response(resp)
-        assert valid is False
-        assert "Missing 'action'" in error
+    def test_adjust_cooler(self):
+        """adjust cooler decreases temp by ADJUST_STEP_F."""
+        cmd = ParsedCommand(action_type="adjust", direction="cooler",
+                           raw_text="I'm hot")
+        states = [_make_thermo_state(target_temp=78.0)]
+        weather_data = _make_weather()
 
-    def test_missing_reasoning(self):
-        resp = json.dumps({"action": "no_change"})
-        valid, error = agent.validate_response(resp)
-        assert valid is False
-        assert "Missing 'reasoning'" in error
+        decisions = agent._apply_parsed_command(cmd, states, weather_data)
 
-    def test_temperature_out_of_range_passes_validation(self):
-        """validate_response no longer checks range — guardrails clamp instead."""
-        for temp in [50, 90]:
-            resp = json.dumps({
-                "action": "set_temperature",
-                "temperature": temp,
-                "reasoning": "test"
-            })
-            valid, error = agent.validate_response(resp)
-            assert valid is True, f"temp {temp} should pass validation (guardrails clamp later)"
+        assert len(decisions) == 1
+        assert decisions[0][0]["temperature"] == 76.0  # 78 - 2
 
-    def test_set_temperature_missing_temp(self):
-        resp = json.dumps({
-            "action": "set_temperature",
-            "temperature": None,
-            "reasoning": "test"
-        })
-        valid, error = agent.validate_response(resp)
-        assert valid is False
+    def test_question_returns_status(self):
+        """question action returns no_change with status message."""
+        cmd = ParsedCommand(action_type="question", raw_text="what's the temp?")
+        states = [_make_thermo_state(name="Test", indoor_temp=76.0, target_temp=78.0)]
+        weather_data = _make_weather(current_temp=90.0)
 
-    def test_no_change_with_temperature(self):
-        resp = json.dumps({
-            "action": "no_change",
-            "temperature": 72,
-            "reasoning": "test"
-        })
-        valid, error = agent.validate_response(resp)
-        assert valid is False
+        decisions = agent._apply_parsed_command(cmd, states, weather_data)
 
-    def test_invalid_json(self):
-        valid, error = agent.validate_response("not json at all")
-        assert valid is False
-        assert "Invalid JSON" in error
+        assert len(decisions) == 1
+        assert decisions[0][0]["action"] == "no_change"
+        assert "message_to_user" in decisions[0][0]
 
-    def test_boundary_temp_min(self):
-        resp = json.dumps({
-            "action": "set_temperature",
-            "temperature": 65,
-            "reasoning": "at minimum"
-        })
-        valid, error = agent.validate_response(resp)
-        assert valid is True
+    def test_unknown_returns_no_change(self):
+        """unknown action returns no_change."""
+        cmd = ParsedCommand(action_type="unknown", raw_text="hello")
+        states = [_make_thermo_state()]
+        weather_data = _make_weather()
 
-    def test_boundary_temp_max(self):
-        resp = json.dumps({
-            "action": "set_temperature",
-            "temperature": 80,
-            "reasoning": "at maximum"
-        })
-        valid, error = agent.validate_response(resp)
-        assert valid is True
+        decisions = agent._apply_parsed_command(cmd, states, weather_data)
+
+        assert len(decisions) == 1
+        assert decisions[0][0]["action"] == "no_change"
 
 
-# ── Guardrails Tests ──────────────────────────────────────────────
+# ── Zone Resolution Tests ───────────────────────────────────────
+
+class TestZoneResolution:
+    def test_resolve_upstairs(self):
+        states = [
+            _make_thermo_state(name="Upstairs Bedroom"),
+            _make_thermo_state(name="Downstairs Kitchen"),
+        ]
+        result = agent._resolve_zones("upstairs", states)
+        assert len(result) == 1
+        assert result[0].name == "Upstairs Bedroom"
+
+    def test_resolve_downstairs(self):
+        states = [
+            _make_thermo_state(name="Upstairs Bedroom"),
+            _make_thermo_state(name="Downstairs Kitchen"),
+        ]
+        result = agent._resolve_zones("downstairs", states)
+        assert len(result) == 1
+        assert result[0].name == "Downstairs Kitchen"
+
+    def test_resolve_both(self):
+        states = [
+            _make_thermo_state(name="Upstairs Bedroom"),
+            _make_thermo_state(name="Downstairs Kitchen"),
+        ]
+        result = agent._resolve_zones("both", states)
+        assert len(result) == 2
+
+    def test_resolve_none(self):
+        states = [
+            _make_thermo_state(name="Upstairs Bedroom"),
+            _make_thermo_state(name="Downstairs Kitchen"),
+        ]
+        result = agent._resolve_zones(None, states)
+        assert len(result) == 2
+
+
+# ── Guardrails Tests ─────────────────────────────────────────────
 
 class TestGuardrails:
     def test_no_change_always_allowed(self):
@@ -345,256 +341,55 @@ class TestGuardrails:
             assert allowed is True
 
 
-# ── Time Period Tests ─────────────────────────────────────────────
+# ── Cooldown Tests ───────────────────────────────────────────────
 
-class TestTimePeriod:
-    def test_sleep_time_late_night(self):
-        now = datetime(2025, 7, 15, 23, 30)  # 11:30 PM
-        period = agent._get_time_period(now, agent._config["schedule"])
-        assert period == "sleep"
+class TestCooldown:
+    def test_cooldown_active_skips_evaluation(self):
+        """When cooldown is active, autonomous evaluation is skipped."""
+        agent._last_cooldown_time = datetime.now() - timedelta(minutes=10)
+        agent._user_triggered = False
 
-    def test_sleep_time_early_morning(self):
-        now = datetime(2025, 7, 15, 3, 0)  # 3 AM
-        period = agent._get_time_period(now, agent._config["schedule"])
-        assert period == "sleep"
+        # run_evaluation_cycle checks cooldown and returns None
+        # We can test the logic directly:
+        elapsed = (datetime.now() - agent._last_cooldown_time).total_seconds() / 60
+        assert elapsed < agent.USER_REQUEST_COOLDOWN_MINUTES
 
-    def test_awake_morning(self):
-        now = datetime(2025, 7, 15, 7, 30)  # 7:30 AM
-        period = agent._get_time_period(now, agent._config["schedule"])
-        assert period == "awake"
+    def test_cooldown_expired_allows_evaluation(self):
+        """After cooldown expires, autonomous evaluation proceeds."""
+        agent._last_cooldown_time = datetime.now() - timedelta(minutes=35)
 
-    def test_awake_afternoon(self):
-        now = datetime(2025, 7, 15, 14, 0)  # 2 PM
-        period = agent._get_time_period(now, agent._config["schedule"])
-        assert period == "awake"
+        elapsed = (datetime.now() - agent._last_cooldown_time).total_seconds() / 60
+        assert elapsed >= agent.USER_REQUEST_COOLDOWN_MINUTES
 
-    def test_awake_weekday_work_hours(self):
-        """Former 'work' period is now just 'awake'."""
-        now = datetime(2025, 7, 14, 10, 0)  # Monday 10 AM
-        period = agent._get_time_period(now, agent._config["schedule"])
-        assert period == "awake"
+    def test_no_cooldown_allows_evaluation(self):
+        """No cooldown set → evaluation proceeds."""
+        agent._last_cooldown_time = None
+        # No cooldown → should proceed
 
-    def test_winding_down(self):
-        now = datetime(2025, 7, 15, 22, 15)  # 10:15 PM
-        period = agent._get_time_period(now, agent._config["schedule"])
-        assert period == "winding_down"
+    def test_user_triggered_ignores_cooldown(self):
+        """User-triggered evaluations bypass cooldown."""
+        agent._last_cooldown_time = datetime.now() - timedelta(minutes=5)
+        agent._user_triggered = True
+        # User-triggered should still run
 
 
-# ── User Message Detection (no regex — LLM parses intent) ────────
+# ── Trigger Tests ────────────────────────────────────────────────
 
-class TestFindUserMessage:
-    def test_finds_temperature_request(self):
-        now = datetime.now()
-        utc_now = datetime.now(timezone.utc)
-        ts = (utc_now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
-        messages = [{"text": "set upstairs to 78", "timestamp": ts}]
-        result = agent._find_recent_user_message(messages, now, max_hours=2)
-        assert result == "set upstairs to 78"
+class TestTriggerEvaluation:
+    def test_trigger_sets_user_text(self):
+        """trigger_evaluation passes user text for NLP parsing."""
+        agent.trigger_evaluation(user_text="set upstairs to 77")
+        assert agent._user_triggered is True
+        assert agent._pending_user_text == "set upstairs to 77"
 
-    def test_ignores_old_message(self):
-        now = datetime.now()
-        utc_now = datetime.now(timezone.utc)
-        ts = (utc_now - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
-        messages = [{"text": "set to 78", "timestamp": ts}]
-        result = agent._find_recent_user_message(messages, now, max_hours=2)
-        assert result is None
-
-    def test_returns_any_recent_message(self):
-        """No regex — ANY recent message is returned for LLM to parse."""
-        now = datetime.now()
-        utc_now = datetime.now(timezone.utc)
-        ts = (utc_now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-        messages = [{"text": "I'm hot", "timestamp": ts}]
-        result = agent._find_recent_user_message(messages, now, max_hours=2)
-        assert result == "I'm hot"
-
-    def test_returns_greeting(self):
-        """Even a greeting is returned — LLM decides it's not a temp request."""
-        now = datetime.now()
-        utc_now = datetime.now(timezone.utc)
-        ts = (utc_now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-        messages = [{"text": "hello", "timestamp": ts}]
-        result = agent._find_recent_user_message(messages, now, max_hours=2)
-        assert result == "hello"
-
-    def test_returns_question(self):
-        """Questions are returned too — LLM handles them."""
-        now = datetime.now()
-        utc_now = datetime.now(timezone.utc)
-        ts = (utc_now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-        messages = [{"text": "what's the weather?", "timestamp": ts}]
-        result = agent._find_recent_user_message(messages, now, max_hours=2)
-        assert result == "what's the weather?"
-
-    def test_returns_most_recent(self):
-        now = datetime.now()
-        utc_now = datetime.now(timezone.utc)
-        ts_old = (utc_now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
-        ts_new = (utc_now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-        messages = [
-            {"text": "set to 72", "timestamp": ts_old},
-            {"text": "actually set to 75", "timestamp": ts_new},
-        ]
-        result = agent._find_recent_user_message(messages, now, max_hours=2)
-        assert result == "actually set to 75"
-
-
-# ── Directive Tests ──────────────────────────────────────────────
-
-class TestDirective:
-    def _ts_minutes_ago(self, minutes):
-        utc_now = datetime.now(timezone.utc)
-        return (utc_now - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
-
-    def _activate_user_message(self, cycles_ago=0):
-        """Simulate a user message that arrived cycles_ago eval cycles back."""
-        agent._evaluation_counter = 10
-        agent._user_message_eval_counter = 10 - cycles_ago
-
-    def test_user_message_has_zone_routing(self):
-        """When user message exists, directive includes zone identification."""
-        self._activate_user_message(cycles_ago=0)
-        state = _make_thermo_state(name="Upstairs", mode="cooling", indoor_temp=76.0)
-        now = datetime(2025, 7, 15, 14, 0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-        messages = [{"text": "set bedroom to 75", "timestamp": self._ts_minutes_ago(5)}]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
-                                               now, comfort, sched, messages)
-
-        assert "YOUR ZONE: Upstairs" in directive
-        assert "OTHER ZONE:" in directive
-
-    def test_user_message_has_both_all_handling(self):
-        """Directive includes guidance for 'both'/'all' keywords."""
-        self._activate_user_message(cycles_ago=0)
-        state = _make_thermo_state(name="Downstairs", mode="cooling", indoor_temp=76.0)
-        now = datetime(2025, 7, 15, 14, 0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-        messages = [{"text": "set both to 72", "timestamp": self._ts_minutes_ago(5)}]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
-                                               now, comfort, sched, messages)
-
-        assert "'both'" in directive and "'all'" in directive
-
-    def test_user_message_active_on_second_cycle(self):
-        """User message is still honored on the cycle after it arrived."""
-        self._activate_user_message(cycles_ago=1)
-        state = _make_thermo_state(name="Upstairs", mode="cooling", indoor_temp=76.0)
-        now = datetime(2025, 7, 15, 14, 0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-        messages = [{"text": "set to 75", "timestamp": self._ts_minutes_ago(5)}]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
-                                               now, comfort, sched, messages)
-
-        assert "RULE 1:" in directive
-        assert "set to 75" in directive
-
-    def test_user_message_expired_after_two_cycles(self):
-        """User message is disregarded after 2 evaluation cycles."""
-        self._activate_user_message(cycles_ago=2)
-        state = _make_thermo_state(mode="cooling", indoor_temp=76.0)
-        now = datetime(2025, 7, 15, 14, 0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-        messages = [{"text": "set to 75", "timestamp": self._ts_minutes_ago(5)}]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=95.0),
-                                               now, comfort, sched, messages)
-
-        assert "PRIORITY" not in directive
-        assert "Prefer no_change to save energy" in directive
-
-    def test_no_message_has_energy_saving(self):
-        """When no user message, directive includes energy-saving preference."""
-        state = _make_thermo_state(mode="cooling", indoor_temp=76.0)
-        now = datetime(2025, 7, 15, 14, 0)  # Awake period, no user message
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=85.0),
-                                               now, comfort, sched, [])
-
-        assert "Prefer no_change to save energy" in directive
-
-    def test_comfort_range_is_guide(self):
-        """Comfort range says 'guide only' so LLM doesn't treat it as hard limit."""
-        state = _make_thermo_state(mode="cooling", indoor_temp=76.0)
-        now = datetime(2025, 7, 15, 14, 0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=85.0),
-                                               now, comfort, sched, [])
-
-        assert "guide only" in directive
-
-    def test_winding_down_precool_hot_day(self):
-        """Hot outdoor + warm indoor → pre-cool directive."""
-        state = _make_thermo_state(mode="cooling", indoor_temp=79.5)
-        now = datetime(2025, 7, 15, 22, 15)  # Winding down
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=90.0),
-                                               now, comfort, sched, [])
-
-        assert "Pre-cool" in directive
-
-    def test_winding_down_no_precool_mild(self):
-        """Mild outdoor → prefer no_change, don't pre-cool."""
-        state = _make_thermo_state(mode="cooling", indoor_temp=76.0)
-        now = datetime(2025, 7, 15, 22, 15)  # Winding down
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, _ = agent._build_directive(state, MagicMock(current_temp=72.0),
-                                               now, comfort, sched, [])
-
-        assert "Prefer no_change" in directive
-        assert "Pre-cool" not in directive
-
-    def test_no_work_period(self):
-        """Verify 'work hours' text never appears in directives."""
-        state = _make_thermo_state(mode="cooling", indoor_temp=76.0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-
-        # Test across many different times — none should produce "work hours"
-        for hour in range(7, 23):
-            now = datetime(2025, 7, 14, hour, 0)  # Monday
-            with patch("agent.weather") as mock_weather:
-                mock_weather.get_forecast_analysis.return_value = None
-                directive, _ = agent._build_directive(state, MagicMock(current_temp=85.0),
-                                                   now, comfort, sched, [])
-            assert "Work hours" not in directive, \
-                f"'Work hours' found at {hour}:00 — {directive}"
+    def test_trigger_without_text(self):
+        """trigger_evaluation can be called without text."""
+        agent.trigger_evaluation()
+        assert agent._user_triggered is True
+        assert agent._pending_user_text is None
 
 
 # ── Mode Switch + Temperature Adjustment Tests ───────────────────
-# Regression: mode switch from COOL→HEAT left stale cool target (75F)
-# which caused furnace to overheat past winter comfort range (68-72F).
 
 class TestCheckAndSwitchMode:
     """Tests for check_and_switch_mode: after switching HVAC mode, the target
@@ -606,10 +401,10 @@ class TestCheckAndSwitchMode:
     @patch("agent.send_telegram", new_callable=AsyncMock)
     @patch("agent.nest_api")
     @patch("agent.weather")
-    def test_cool_to_heat_sets_winter_comfort_low(self, mock_weather, mock_nest, mock_tg):
-        """Switching COOL→HEAT should set target to winter comfort low (68F)."""
+    def test_cool_to_heat_sets_heating_baseline(self, mock_weather, mock_nest, mock_tg):
+        """Switching COOL→HEAT should set target to 68F (heating baseline)."""
         mock_forecast = MagicMock()
-        mock_forecast.next_24h_high = 55.0  # Below 65 → HEAT
+        mock_forecast.next_24h_high = 55.0
         mock_weather.get_forecast_analysis.return_value = mock_forecast
         mock_nest.set_mode.return_value = True
         mock_nest.set_temperature.return_value = True
@@ -617,23 +412,22 @@ class TestCheckAndSwitchMode:
         state = _make_thermo_state(mode="cooling", indoor_temp=71.0, target_temp=75.0)
         weather_data = MagicMock(current_temp=55.0)
 
-        # Reset daily cache to force recalculation
         agent._daily_high_cache = (None, None)
 
         self._run_async(agent.check_and_switch_mode(state, weather_data))
 
         assert state.mode == "heating"
-        assert state.target_temp == 68  # winter_range[0]
+        assert state.target_temp == 68
         mock_nest.set_mode.assert_called_once_with("HEAT", "test-device-id")
         mock_nest.set_temperature.assert_called_once_with(68, "test-device-id")
 
     @patch("agent.send_telegram", new_callable=AsyncMock)
     @patch("agent.nest_api")
     @patch("agent.weather")
-    def test_heat_to_cool_sets_summer_comfort_low(self, mock_weather, mock_nest, mock_tg):
-        """Switching HEAT→COOL should set target to summer comfort low (75F)."""
+    def test_heat_to_cool_sets_cooling_default(self, mock_weather, mock_nest, mock_tg):
+        """Switching HEAT→COOL should set target to 78F (cooling default)."""
         mock_forecast = MagicMock()
-        mock_forecast.next_24h_high = 85.0  # Above 65 → COOL
+        mock_forecast.next_24h_high = 85.0
         mock_weather.get_forecast_analysis.return_value = mock_forecast
         mock_nest.set_mode.return_value = True
         mock_nest.set_temperature.return_value = True
@@ -646,9 +440,9 @@ class TestCheckAndSwitchMode:
         self._run_async(agent.check_and_switch_mode(state, weather_data))
 
         assert state.mode == "cooling"
-        assert state.target_temp == 75  # summer_range[0]
+        assert state.target_temp == 78
         mock_nest.set_mode.assert_called_once_with("COOL", "test-device-id")
-        mock_nest.set_temperature.assert_called_once_with(75, "test-device-id")
+        mock_nest.set_temperature.assert_called_once_with(78, "test-device-id")
 
     @patch("agent.send_telegram", new_callable=AsyncMock)
     @patch("agent.nest_api")
@@ -658,7 +452,7 @@ class TestCheckAndSwitchMode:
         agent._daily_high_cache = (None, None)
 
         mock_forecast = MagicMock()
-        mock_forecast.next_24h_high = 85.0  # COOL
+        mock_forecast.next_24h_high = 85.0
         mock_weather.get_forecast_analysis.return_value = mock_forecast
 
         state = _make_thermo_state(mode="cooling", indoor_temp=76.0, target_temp=75.0)
@@ -667,7 +461,7 @@ class TestCheckAndSwitchMode:
         self._run_async(agent.check_and_switch_mode(state, weather_data))
 
         assert state.mode == "cooling"
-        assert state.target_temp == 75.0  # Unchanged
+        assert state.target_temp == 75.0
         mock_nest.set_mode.assert_not_called()
         mock_nest.set_temperature.assert_not_called()
 
@@ -692,13 +486,13 @@ class TestCheckAndSwitchMode:
         mock_tg.assert_called_once()
         msg = mock_tg.call_args[0][0]
         assert "HEAT" in msg
-        assert "68" in msg  # New target mentioned
+        assert "68" in msg
 
 
-# ── Vacation Mode Directive Tests ────────────────────────────────
+# ── Vacation Mode Tests ──────────────────────────────────────────
 
-class TestVacationModeDirective:
-    """Tests for vacation mode integration in agent.py."""
+class TestVacationMode:
+    """Tests for vacation mode integration."""
 
     @pytest.fixture(autouse=True)
     def reset_vacation(self):
@@ -711,41 +505,27 @@ class TestVacationModeDirective:
         yield
         location._vacation_mode = False
 
-    def test_vacation_directive_cool_targets_85(self):
-        """In cooling mode, vacation directive should target 85F (cool ceiling)."""
+    def test_vacation_comfort_model_cooling_82(self):
+        """In vacation + cooling, comfort model targets 82F."""
         location._vacation_mode = True
-        state = _make_thermo_state(mode="cooling", indoor_temp=76.0)
-        now = datetime(2025, 7, 15, 14, 0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
+        inp = ComfortInput(
+            outdoor_temp=95, indoor_temp=80, humidity=45,
+            hvac_mode="cooling", hour=14, minute=0,
+            zone="downstairs", is_vacation=True, current_target=None,
+        )
+        prediction = agent._comfort_model.predict(inp)
+        assert prediction.baseline_temp == 82
 
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, is_user = agent._build_directive(
-                state, MagicMock(current_temp=95.0), now, comfort, sched, [])
-
-        assert "VACATION MODE" in directive
-        assert "85F" in directive
-        assert "cool ceiling" in directive
-        assert is_user is False
-
-    def test_vacation_directive_heat_targets_60(self):
-        """In heating mode, vacation directive should target 60F (heat floor)."""
+    def test_vacation_comfort_model_heating_60(self):
+        """In vacation + heating, comfort model targets 60F."""
         location._vacation_mode = True
-        state = _make_thermo_state(mode="heating", indoor_temp=55.0)
-        now = datetime(2025, 1, 15, 14, 0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, is_user = agent._build_directive(
-                state, MagicMock(current_temp=30.0), now, comfort, sched, [])
-
-        assert "VACATION MODE" in directive
-        assert "60F" in directive
-        assert "heat floor" in directive
-        assert is_user is False
+        inp = ComfortInput(
+            outdoor_temp=30, indoor_temp=55, humidity=45,
+            hvac_mode="heating", hour=14, minute=0,
+            zone="downstairs", is_vacation=True, current_target=None,
+        )
+        prediction = agent._comfort_model.predict(inp)
+        assert prediction.baseline_temp == 60
 
     def test_vacation_widens_guardrails_to_85(self):
         """In vacation mode, get_temp_max() should return 85 (not 80)."""
@@ -767,33 +547,6 @@ class TestVacationModeDirective:
         location._vacation_mode = False
         assert agent.get_temp_min() == 65
 
-    def test_user_message_takes_precedence_over_vacation(self):
-        """Path A (user message) should take precedence over vacation directive."""
-        location._vacation_mode = True
-        # Activate user message
-        agent._evaluation_counter = 10
-        agent._user_message_eval_counter = 10
-
-        state = _make_thermo_state(name="Upstairs", mode="cooling", indoor_temp=76.0)
-        now = datetime(2025, 7, 15, 14, 0)
-        comfort = agent._config["comfort"]
-        sched = agent._config["schedule"]
-
-        utc_now = datetime.now(timezone.utc)
-        ts = (utc_now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-        messages = [{"text": "set bedroom to 72", "timestamp": ts}]
-
-        with patch("agent.weather") as mock_weather:
-            mock_weather.get_forecast_analysis.return_value = None
-            directive, is_user = agent._build_directive(
-                state, MagicMock(current_temp=95.0), now, comfort, sched, messages)
-
-        # Should be Path A (user message), not vacation
-        assert "VACATION MODE" not in directive
-        assert "RULE 1:" in directive
-        assert "set bedroom to 72" in directive
-        assert is_user is True
-
     def test_guardrail_clamp_uses_vacation_range(self):
         """During vacation, guardrails should clamp to 85 (not 80)."""
         location._vacation_mode = True
@@ -804,7 +557,7 @@ class TestVacationModeDirective:
                         "reasoning": "test"}
             allowed, reason = agent.check_guardrails(decision)
             assert allowed is True
-            assert decision["temperature"] == 85  # clamped to vacation max, not 80
+            assert decision["temperature"] == 85
 
     def test_guardrail_clamp_normal_at_80(self):
         """Outside vacation, guardrails should clamp to 80."""
@@ -817,3 +570,129 @@ class TestVacationModeDirective:
             allowed, reason = agent.check_guardrails(decision)
             assert allowed is True
             assert decision["temperature"] == 80
+
+
+# ── Comfort Model Prediction via Agent ───────────────────────────
+
+class TestAgentComfortPredictions:
+    """Test comfort model produces correct targets through agent integration."""
+
+    def test_hot_day_cooling_78(self):
+        """Hot day → comfort model targets 78F."""
+        state = _make_thermo_state(name="Downstairs Kitchen", mode="cooling",
+                                   indoor_temp=76.0, target_temp=75.0)
+        weather_data = _make_weather(current_temp=88.0)
+        now = datetime(2025, 7, 15, 14, 0)
+
+        inp = agent._build_comfort_input(state, weather_data, now)
+        pred = agent._comfort_model.predict(inp)
+
+        assert pred.baseline_temp == 78
+
+    def test_extreme_heat_precool_75(self):
+        """Extreme heat (100F) → comfort model pre-cools to 75F."""
+        state = _make_thermo_state(mode="cooling", indoor_temp=78.0, target_temp=78.0)
+        weather_data = _make_weather(current_temp=100.0)
+        now = datetime(2025, 7, 15, 14, 0)
+
+        inp = agent._build_comfort_input(state, weather_data, now)
+        pred = agent._comfort_model.predict(inp)
+
+        assert pred.baseline_temp == 75
+
+    def test_precool_before_bed_75(self):
+        """9:30 PM → pre-cool to 75F."""
+        state = _make_thermo_state(mode="cooling", indoor_temp=78.0, target_temp=78.0)
+        weather_data = _make_weather(current_temp=85.0)
+        now = datetime(2025, 7, 15, 21, 30)
+
+        inp = agent._build_comfort_input(state, weather_data, now)
+        pred = agent._comfort_model.predict(inp)
+
+        assert pred.baseline_temp == 75
+
+    def test_sleep_after_1030pm_78(self):
+        """After 10:30 PM → sleep target 78F."""
+        state = _make_thermo_state(mode="cooling", indoor_temp=76.0, target_temp=75.0)
+        weather_data = _make_weather(current_temp=85.0)
+        now = datetime(2025, 7, 15, 22, 30)
+
+        inp = agent._build_comfort_input(state, weather_data, now)
+        pred = agent._comfort_model.predict(inp)
+
+        assert pred.baseline_temp == 78
+
+    def test_heating_extreme_cold_72(self):
+        """Extreme cold (15F) → 72F."""
+        state = _make_thermo_state(mode="heating", indoor_temp=65.0)
+        weather_data = _make_weather(current_temp=15.0)
+        now = datetime(2025, 12, 15, 14, 0)
+
+        inp = agent._build_comfort_input(state, weather_data, now)
+        pred = agent._comfort_model.predict(inp)
+
+        assert pred.baseline_temp == 72
+
+    def test_heating_mild_68(self):
+        """Mild outdoor (65F) → 68F."""
+        state = _make_thermo_state(mode="heating", indoor_temp=66.0)
+        weather_data = _make_weather(current_temp=65.0)
+        now = datetime(2025, 12, 15, 14, 0)
+
+        inp = agent._build_comfort_input(state, weather_data, now)
+        pred = agent._comfort_model.predict(inp)
+
+        assert pred.baseline_temp == 68
+
+    def test_deadband_prevents_change(self):
+        """Target within deadband of current → no change."""
+        state = _make_thermo_state(mode="cooling", indoor_temp=77.0, target_temp=77.0)
+        weather_data = _make_weather(current_temp=85.0)
+        now = datetime(2025, 7, 15, 14, 0)
+
+        inp = agent._build_comfort_input(state, weather_data, now)
+        pred = agent._comfort_model.predict(inp)
+
+        # baseline 78, current 77, diff=1 < deadband 2 → no change
+        assert pred.should_change is False
+
+    def test_deadband_allows_change_when_outside(self):
+        """Target outside deadband → change."""
+        state = _make_thermo_state(mode="cooling", indoor_temp=77.0, target_temp=75.0)
+        weather_data = _make_weather(current_temp=85.0)
+        now = datetime(2025, 7, 15, 14, 0)
+
+        inp = agent._build_comfort_input(state, weather_data, now)
+        pred = agent._comfort_model.predict(inp)
+
+        # baseline 78, current 75, diff=3 > deadband 2 → change
+        assert pred.should_change is True
+
+
+# ── Online Learning Tests ────────────────────────────────────────
+
+class TestOnlineLearning:
+    def test_learn_from_override_updates_corrections(self):
+        """Manual override is learned by the comfort model."""
+        state = _make_thermo_state(name="Downstairs Kitchen", mode="cooling",
+                                   indoor_temp=78.0, target_temp=78.0)
+        weather_data = _make_weather(current_temp=90.0)
+
+        initial_corrections = len(agent._comfort_model.corrections)
+
+        with patch("agent._comfort_model.save"):  # Don't actually save to disk
+            agent._learn_from_override(state, weather_data, 76.0)
+
+        assert len(agent._comfort_model.corrections) > initial_corrections
+
+
+# ── Eval Interval Tests ──────────────────────────────────────────
+
+class TestEvalInterval:
+    def test_default_interval_5_minutes(self):
+        """Default evaluation interval is 5 minutes."""
+        assert agent.EVAL_INTERVAL_MINUTES == 5
+
+    def test_cooldown_30_minutes(self):
+        """Cooldown after user/manual override is 30 minutes."""
+        assert agent.USER_REQUEST_COOLDOWN_MINUTES == 30

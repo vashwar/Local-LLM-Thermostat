@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AI Thermostat Agent — The Brain
-Autonomous climate control using a local LLM (Qwen 4B via llama.cpp).
+Hybrid architecture: comfort model for autonomous decisions, LLM for NLP only.
 """
 
 import asyncio
@@ -26,6 +26,8 @@ import location
 import weather
 import nest_api
 import llm_server
+from comfort_model import ComfortModel, ComfortInput
+import nlp_parser
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +35,10 @@ logger = logging.getLogger(__name__)
 TEMP_MIN_NORMAL = 65
 TEMP_MAX_NORMAL = 80
 MAX_CHANGES_PER_HOUR = 6
-MANUAL_OVERRIDE_BACKOFF_MINUTES = 120
-USER_REQUEST_BACKOFF_MINUTES = 40
-MODE_TRANSITION_GAP_MINUTES = 5
+MANUAL_OVERRIDE_BACKOFF_MINUTES = 30   # Cooldown after manual override
+USER_REQUEST_COOLDOWN_MINUTES = 30     # Cooldown after user message
+EVAL_INTERVAL_MINUTES = 5             # Autonomous evaluation interval
+ADJUST_STEP_F = 2.0                   # Temperature step for "warmer"/"cooler"
 
 
 def get_temp_min() -> int:
@@ -52,28 +55,16 @@ def get_temp_max() -> int:
     return TEMP_MAX_NORMAL
 
 
-# ── System prompt — compact for Qwen 4B ──────────────────────────
-SYSTEM_PROMPT = """You are a thermostat agent for the {zone_name} zone.
-
-{state}
-
-{directive}
-
-{user_messages}
-
-Respond with ONLY this JSON (action MUST be "set_temperature" or "no_change"):
-{{"action":"set_temperature"|"no_change","temperature":<{temp_min}-{temp_max} or null>,"reasoning":"<brief>","message_to_user":"<optional or null>"}}"""
-
 # ── Module-level state ────────────────────────────────────────────
 _config: dict = {}
+_comfort_model: Optional[ComfortModel] = None
 _last_evaluation_result: Optional[dict] = None
-_evaluation_counter: int = 0  # Incremented each completed cycle
-_user_triggered: bool = False  # True when evaluation was triggered by a user message
-_user_message_eval_counter: Optional[int] = None  # Counter when last user message arrived
-USER_MESSAGE_MAX_CYCLES = 2  # Disregard user message after this many eval cycles
-_telegram_send_fn = None  # Set by telegram_bot on startup
-_last_user_request_time: Optional[datetime] = None  # When last user-triggered change executed
-_daily_high_cache: tuple = (None, None)  # (date_str, daily_high_F) — locked on first eval of the day
+_evaluation_counter: int = 0
+_user_triggered: bool = False
+_pending_user_text: Optional[str] = None  # User message waiting to be parsed
+_telegram_send_fn = None
+_last_cooldown_time: Optional[datetime] = None  # Cooldown after user/manual override
+_daily_high_cache: tuple = (None, None)
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -117,7 +108,7 @@ def call_llm(system_prompt: str) -> Tuple[Optional[str], bool]:
         "model": llm_cfg["model"],
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "Make a climate decision based on the context above."}
+            {"role": "user", "content": "Parse the message above."}
         ],
         "temperature": llm_cfg["temperature"],
         "top_p": llm_cfg["top_p"],
@@ -137,7 +128,6 @@ def call_llm(system_prompt: str) -> Tuple[Optional[str], bool]:
             # Strip markdown code fences (e.g. ```json ... ```)
             if content.startswith("```"):
                 lines = content.split("\n")
-                # Remove first line (```json) and last line (```)
                 lines = [l for l in lines if not l.strip().startswith("```")]
                 content = "\n".join(lines).strip()
 
@@ -167,287 +157,164 @@ def call_llm(system_prompt: str) -> Tuple[Optional[str], bool]:
     return None, False
 
 
-def validate_response(response_text: str) -> Tuple[bool, Optional[str]]:
-    """
-    Validate LLM response JSON structure.
-    Reuses logic from test_qwen_4b.py validate_response().
-    """
+# ── Comfort Model Integration ────────────────────────────────────
+
+def init_comfort_model(config: dict):
+    """Initialize and train the comfort model on startup."""
+    global _comfort_model
+    cm_cfg = config.get("comfort_model", {})
+    deadband = cm_cfg.get("deadband_f", 2.0)
+    _comfort_model = ComfortModel(deadband_f=deadband)
+
+    # Load saved corrections
+    corrections_path = cm_cfg.get("corrections_path", "comfort_corrections.json")
+    _comfort_model.load(corrections_path)
+
+    # Train from historical data if configured
+    if cm_cfg.get("retrain_on_startup", True):
+        _run_initial_training()
+
+    logger.info("Comfort model initialized (deadband=%.1fF, corrections=%d)",
+                deadband, len(_comfort_model.corrections))
+
+
+def _run_initial_training():
+    """Train comfort model from historical database data."""
     try:
-        data = json.loads(response_text)
+        # Train zone offsets from climate data
+        climate_data = database.get_all_climate_data()
+        if climate_data:
+            _comfort_model.train_zone_offsets(climate_data)
+            logger.info("Zone offsets trained from %d climate records", len(climate_data))
 
-        if "action" not in data:
-            return False, "Missing 'action' field"
+        # Train corrections from manual overrides
+        overrides = database.get_manual_overrides_with_context()
+        if overrides:
+            _comfort_model.train_from_overrides(overrides)
+            logger.info("Corrections trained from %d overrides", len(overrides))
 
-        if data["action"] not in ["set_temperature", "no_change"]:
-            return False, f"Invalid action: {data['action']}"
+        # Save trained model
+        cm_cfg = _config.get("comfort_model", {})
+        _comfort_model.save(cm_cfg.get("corrections_path", "comfort_corrections.json"))
 
-        if "reasoning" not in data:
-            return False, "Missing 'reasoning' field"
-
-        if data["action"] == "set_temperature":
-            if "temperature" not in data or data["temperature"] is None:
-                return False, "set_temperature action missing temperature"
-
-        if data["action"] == "no_change":
-            if "temperature" in data and data["temperature"] is not None:
-                return False, "no_change action should not set temperature"
-
-        return True, None
-
-    except json.JSONDecodeError as e:
-        return False, f"Invalid JSON: {e}"
+    except Exception as e:
+        logger.warning("Initial training failed (will use baseline only): %s", e)
 
 
-def build_context(thermo_state, weather_data, all_states=None) -> str:
-    """
-    Assemble a compact prompt for Qwen 4B.
-    Python does the heavy reasoning — determines the situation, comfort range,
-    and directive. The LLM just makes the final call with clear, short context.
-    """
-    recent_msgs = database.get_recent_messages(10)
-    now = datetime.now()
-    comfort = _config.get("comfort", {})
-    sched = _config.get("schedule", {})
-
-    # ── Build state summary (compact) ──
-    state_lines = [
-        f"Indoor: {thermo_state.indoor_temp}F, {thermo_state.humidity}% humidity",
-        f"HVAC mode: {thermo_state.mode}, target: {thermo_state.target_temp or 'none'}F",
-        f"Outdoor: {weather_data.current_temp}F, {weather_data.forecast_summary}",
-        f"Time: {now.strftime('%I:%M %p')} {now.strftime('%A')}",
-    ]
-    if all_states:
-        for s in all_states:
-            if s.device_id != thermo_state.device_id:
-                state_lines.append(f"Other zone {s.name}: {s.indoor_temp}F, target={s.target_temp}F")
-
-    # ── Analyze situation in Python and build directive ──
-    directive, is_user_request = _build_directive(thermo_state, weather_data, now, comfort, sched, recent_msgs)
-
-    # ── Format user messages (compact) ──
-    # When a user request is active (Path A), only show the latest message
-    # (not the last 3) to avoid older messages confusing zone routing.
-    if is_user_request:
-        user_msg_section = _format_user_messages(recent_msgs[-1:], now)
-    else:
-        user_msg_section = _format_user_messages(recent_msgs, now)
-
-    return SYSTEM_PROMPT.format(
-        zone_name=thermo_state.name,
-        state="\n".join(state_lines),
-        directive=directive,
-        user_messages=user_msg_section,
-        temp_min=get_temp_min(),
-        temp_max=get_temp_max(),
+def _build_comfort_input(thermo_state, weather_data, now: datetime) -> ComfortInput:
+    """Build a ComfortInput from current state."""
+    return ComfortInput(
+        outdoor_temp=weather_data.current_temp,
+        indoor_temp=thermo_state.indoor_temp,
+        humidity=thermo_state.humidity,
+        hvac_mode=thermo_state.mode,
+        hour=now.hour,
+        minute=now.minute,
+        zone=thermo_state.name,
+        is_vacation=location.is_vacation_mode(),
+        current_target=thermo_state.target_temp,
     )
 
 
-def _get_message_age_minutes(msg: dict, now: datetime) -> Optional[float]:
-    """Get the age of a message in minutes, or None if timestamp is missing.
-    Note: SQLite stores timestamps as UTC via datetime('now'), and `now` is
-    local time from datetime.now(). We convert the UTC timestamp to local time
-    before comparing.
-    """
-    ts = msg.get("timestamp", "")
-    if not ts:
-        return None
+def _learn_from_override(thermo_state, weather_data, user_target: float):
+    """Feed a manual override or user request to the comfort model for online learning."""
+    if _comfort_model is None:
+        return
     try:
-        # SQLite datetime('now') returns UTC. Parse as UTC, convert to local.
-        from datetime import timezone
-        msg_time_utc = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
-        msg_time_local = msg_time_utc.astimezone().replace(tzinfo=None)
-        return (now - msg_time_local).total_seconds() / 60
-    except (ValueError, TypeError):
-        return None
+        now = datetime.now()
+        inp = _build_comfort_input(thermo_state, weather_data, now)
+        _comfort_model.learn_override(inp, user_target)
+
+        # Save updated corrections
+        cm_cfg = _config.get("comfort_model", {})
+        _comfort_model.save(cm_cfg.get("corrections_path", "comfort_corrections.json"))
+    except Exception as e:
+        logger.warning("Failed to learn from override: %s", e)
 
 
-def _find_recent_user_message(messages: list, now: datetime, max_hours: float) -> Optional[str]:
-    """Find the most recent user message within max_hours. No filtering — LLM parses intent."""
-    for msg in reversed(messages):
-        text = msg.get("text", "")
-        if not text:
-            continue
-        age = _get_message_age_minutes(msg, now)
-        if age is not None and age <= max_hours * 60:
-            return text
-    return None
+# ── Parsed command handling ──────────────────────────────────────
+
+def _resolve_zones(zone_str: Optional[str], all_states: list) -> list:
+    """Resolve a zone string to a list of thermostat states."""
+    if zone_str is None or zone_str == "both":
+        return all_states
+
+    for state in all_states:
+        name_lower = state.name.lower()
+        if zone_str == "upstairs" and "upstairs" in name_lower:
+            return [state]
+        if zone_str == "downstairs" and "downstairs" in name_lower:
+            return [state]
+
+    # No match — apply to all zones
+    return all_states
 
 
-def _get_time_period(now: datetime, sched: dict) -> str:
-    """Determine the current time period: sleep, winding_down, or awake."""
-    sleep_time = sched.get("sleep_time", "23:00")
-    wake_time = sched.get("wake_time", "07:00")
-    sleep_h, sleep_m = map(int, sleep_time.split(":"))
-    wake_h, wake_m = map(int, wake_time.split(":"))
-
-    cur = now.hour * 60 + now.minute
-    sleep_min = sleep_h * 60 + sleep_m
-    wake_min = wake_h * 60 + wake_m
-
-    if cur >= sleep_min or cur < wake_min:
-        return "sleep"
-    if cur >= sleep_min - 60:
-        return "winding_down"
-    return "awake"
-
-
-def _build_directive(thermo_state, weather_data, now, comfort, sched, messages) -> str:
+def _apply_parsed_command(command, all_states: list, weather_data) -> list:
     """
-    Python pre-processor: analyze the situation and produce a clear, concise
-    directive for the LLM. Two paths:
-      A) User message exists → LLM parses intent with zone-aware prompt
-      B) No user message → Python provides context, energy-saving bias
+    Apply a parsed NLP command to thermostat states.
+    Returns list of (decision_dict, thermo_state) tuples.
     """
-    mode = thermo_state.mode  # "cooling", "heating", "auto", "off"
-    indoor = thermo_state.indoor_temp
-    outdoor = weather_data.current_temp
-    period = _get_time_period(now, sched)
-    user_request_hours = comfort.get("user_request_hours", 2)
+    decisions = []
 
-    # Comfort ranges
-    if mode == "heating":
-        comfort_low, comfort_high = comfort.get("winter_range", [68, 72])
-    else:
-        comfort_low, comfort_high = comfort.get("summer_range", [75, 80])
+    if command.action_type == "set_temp" and command.target_temp is not None:
+        targets = _resolve_zones(command.zone, all_states)
+        for state in targets:
+            decisions.append(({
+                "action": "set_temperature",
+                "temperature": command.target_temp,
+                "reasoning": f"User requested {command.target_temp:.0f}F"
+                             + (f" for {command.zone}" if command.zone else ""),
+            }, state))
 
-    parts = [f"Comfort range: {comfort_low}-{comfort_high}F (guide only -- explicit user requests override this)."]
-
-    # ── Path A: User message exists and within cycle limit → LLM parses ──
-    user_msg_active = (
-        _user_message_eval_counter is not None
-        and _evaluation_counter - _user_message_eval_counter < USER_MESSAGE_MAX_CYCLES
-    )
-    recent_msg = _find_recent_user_message(messages, now, user_request_hours) if user_msg_active else None
-    
-    if recent_msg:
-        zone_name = thermo_state.name
-        
-        # 1. Map Semantic Aliases dynamically based on the current zone
-        if "Upstairs" in zone_name:
-            zone_aliases = "upstairs, bed, bedroom"
-            other_name = "Downstairs Kitchen"
-            other_aliases = "downstairs, kitchen"
-        else:
-            zone_aliases = "downstairs, kitchen"
-            other_name = "Upstairs Bedroom"
-            other_aliases = "upstairs, bed, bedroom"
-            
-        # 2. Overwrite the prompt array with the Ultra-Lean 4-Rule logic
-        parts = [
-            f"Determine the target temperature for YOUR zone.\n",
-            f"YOUR ZONE: {zone_name} (Aliases: {zone_aliases})\n",
-            f"OTHER ZONE: {other_name} (Aliases: {other_aliases})\n",
-            f"RULE 1: The user said: '{recent_msg}'\n",
-            f"RULE 2: If the message targets YOUR ZONE or its aliases, output the requested temperature.\n",
-            f"RULE 3: If the message says 'both', 'all', 'house', or 'everything', output the requested temperature.\n",
-            f"RULE 4: If the message ONLY targets the OTHER ZONE or its aliases, you MUST output \"action\": \"no_change\"."
-        ]
-        return "DIRECTIVE:\n" + "".join(parts), True
-
-
-    # ── Path V: Vacation mode → energy-saving directive (between A and B) ──
-    if location.is_vacation_mode():
-        vmin = location.get_vacation_temp_min()
-        vmax = location.get_vacation_temp_max()
-        if mode == "heating":
-            target = vmin
-            parts = [
-                f"VACATION MODE ACTIVE. Target {target}F (heat floor).",
-                f"Indoor is {indoor}F. Only heat if below {target}F, otherwise no_change.",
-            ]
-        else:
-            target = vmax
-            parts = [
-                f"VACATION MODE ACTIVE. Target {target}F (cool ceiling).",
-                f"Indoor is {indoor}F. Only cool if above {target}F, otherwise no_change.",
-            ]
-        return "DIRECTIVE: " + " ".join(parts), False
-
-    # ── Path B: No user message → Python provides context, energy-saving bias ──
-
-    # Sleep time logic (proven, keep as-is)
-    if period == "sleep":
-        if mode == "cooling":
-            sleep_cool = comfort.get("sleep_cool_temp", 75)
-            override_temp = comfort.get("sleep_cool_override_temp", 80)
-            if indoor <= sleep_cool + 1:
-                parts.append(f"Sleep time, summer. House is cool ({indoor}F). Let it coast — prefer no_change.")
-            elif outdoor > override_temp:
-                parts.append(f"Sleep time, summer. Outdoor is hot ({outdoor}F). Indoor {indoor}F is warm. Cool to {sleep_cool}F.")
+    elif command.action_type == "adjust":
+        targets = _resolve_zones(command.zone, all_states)
+        for state in targets:
+            current = state.target_temp or 75
+            if command.direction == "warmer":
+                new_temp = current + ADJUST_STEP_F
+            elif command.direction == "cooler":
+                new_temp = current - ADJUST_STEP_F
             else:
-                parts.append(f"Sleep time, summer. Outdoor is mild ({outdoor}F). Let the house coast — prefer no_change.")
-        else:  # heating
-            if indoor >= get_temp_min() + 2:
-                parts.append(f"Sleep time, winter. Indoor {indoor}F is fine. Let it drift — prefer no_change.")
-            else:
-                parts.append(f"Sleep time, winter. Indoor {indoor}F is getting cold. Heat to {comfort_low}F.")
+                continue
+            decisions.append(({
+                "action": "set_temperature",
+                "temperature": new_temp,
+                "reasoning": f"User wants it {command.direction} ({current:.0f}F → {new_temp:.0f}F)",
+            }, state))
 
-    elif period == "winding_down":
-        # Pre-cool before bed, but ONLY on hot days when indoor is warm
-        if mode == "cooling":
-            sleep_cool = comfort.get("sleep_cool_temp", 75)
-            if outdoor > comfort_high and indoor >= comfort_high - 1:
-                parts.append(f"Hot day, bedtime approaching. Indoor {indoor}F is warm. Pre-cool to {sleep_cool}F.")
-            else:
-                parts.append(f"Approaching bedtime. Indoor {indoor}F is comfortable. Prefer no_change.")
-        else:
-            parts.append(f"Approaching bedtime. Let the temp settle toward {comfort_low}F.")
+    elif command.action_type in ("question", "status_query"):
+        # No temperature change — return status info
+        decisions.append(({
+            "action": "no_change",
+            "reasoning": "User asked a question",
+            "message_to_user": _build_status_message(all_states, weather_data),
+        }, all_states[0] if all_states else None))
 
     else:
-        # Default for ALL other periods — prefer energy saving
-        parts.append(f"Prefer no_change to save energy unless indoor temp is outside comfort range.")
+        # Unknown — no change
+        if all_states:
+            decisions.append(({
+                "action": "no_change",
+                "reasoning": f"Could not parse: {command.raw_text}",
+                "message_to_user": f"I didn't understand that. Current status:\n"
+                                   + _build_status_message(all_states, weather_data),
+            }, all_states[0]))
 
-    # ── Forecast analysis (Python-parsed, time-aware) ──
-    forecast = weather.get_forecast_analysis()
-    if forecast:
-        if forecast.pre_cool_now and mode == "cooling":
-            parts.append(f"URGENT: {forecast.advisory} Pre-cool to {comfort_low}F now.")
-        elif forecast.pre_heat_now and mode == "heating":
-            parts.append(f"URGENT: {forecast.advisory} Pre-heat to {comfort_high}F now.")
-        elif forecast.advisory:
-            parts.append(f"Forecast: {forecast.advisory}")
-
-    if not forecast or not forecast.advisory:
-        if outdoor > 100:
-            parts.append(f"Extreme heat outside ({outdoor}F). Pre-condition aggressively.")
-        elif outdoor < 35:
-            parts.append(f"Very cold outside ({outdoor}F). Keep the house warm.")
-
-    # ── Question detection ──
-    if messages:
-        last_text = messages[-1].get("text", "")
-        last_age = _get_message_age_minutes(messages[-1], now)
-        if last_age is not None and last_age < 30:
-            if "?" in last_text or any(w in last_text.lower() for w in ["what", "how", "when", "is it", "will it"]):
-                parts.append(f"User asked: '{last_text}'. Answer in message_to_user. Use no_change.")
-
-    return "DIRECTIVE: " + " ".join(parts), False
+    return decisions
 
 
-def _format_user_messages(messages: list, now: datetime) -> str:
-    """Format recent user messages — compact, only if relevant."""
-    if not messages:
-        return ""
+def _build_status_message(all_states: list, weather_data) -> str:
+    """Build a status summary for user questions."""
+    lines = []
+    for s in all_states:
+        lines.append(f"{s.name}: {s.indoor_temp:.0f}F, target {s.target_temp or '?'}F, "
+                     f"{'running' if s.hvac_running else 'idle'}")
+    lines.append(f"Outdoor: {weather_data.current_temp:.0f}F")
+    return "\n".join(lines)
 
-    formatted = []
-    for msg in messages[-3:]:  # Last 3 only — save tokens
-        text = msg.get("text", "")
-        if not text:
-            continue
-        age = _get_message_age_minutes(msg, now)
-        if age is not None:
-            if age < 60:
-                age_str = f"{int(age)}m ago"
-            else:
-                age_str = f"{age / 60:.1f}h ago"
-            formatted.append(f"User ({age_str}): {text}")
-        else:
-            formatted.append(f"User: {text}")
 
-    if not formatted:
-        return ""
-    return "Messages:\n" + "\n".join(formatted)
-
+# ── Guardrails ───────────────────────────────────────────────────
 
 def check_guardrails(decision: dict, user_triggered: bool = False) -> Tuple[bool, Optional[str]]:
     """
@@ -463,7 +330,7 @@ def check_guardrails(decision: dict, user_triggered: bool = False) -> Tuple[bool
     # Temperature bounds — clamp instead of block
     if temp is not None and not (get_temp_min() <= temp <= get_temp_max()):
         clamped = max(get_temp_min(), min(get_temp_max(), temp))
-        logger.warning("Guardrail clamp: LLM requested %sF, clamped to %sF", temp, clamped)
+        logger.warning("Guardrail clamp: requested %sF, clamped to %sF", temp, clamped)
         decision["temperature"] = clamped
         decision["reasoning"] = f"[Clamped {temp}F->{clamped}F] " + decision.get("reasoning", "")
 
@@ -484,6 +351,8 @@ def check_guardrails(decision: dict, user_triggered: bool = False) -> Tuple[bool
 
     return True, None
 
+
+# ── Decision execution ───────────────────────────────────────────
 
 async def execute_decision(decision: dict, thermo_state, weather_data, raw_response: str,
                            user_triggered: bool = False):
@@ -531,8 +400,6 @@ async def execute_decision(decision: dict, thermo_state, weather_data, raw_respo
     # Execute temperature change
     if action == "set_temperature" and temperature is not None:
         # Edge case: user wants to heat when system is in cool mode.
-        # Indoor is 65-70F and target > indoor — cool mode won't heat.
-        # Switch to HEAT so the setpoint actually activates the furnace.
         if (user_triggered
                 and thermo_state.mode == "cooling"
                 and temperature > thermo_state.indoor_temp
@@ -540,7 +407,7 @@ async def execute_decision(decision: dict, thermo_state, weather_data, raw_respo
             logger.info("[%s] User wants %.0fF but indoor is %.0fF in cool mode — switching to HEAT",
                         zone, temperature, thermo_state.indoor_temp)
             await asyncio.to_thread(nest_api.set_mode, "HEAT", thermo_state.device_id)
-            await asyncio.sleep(10)  # Let Nest propagate the mode change
+            await asyncio.sleep(10)
 
         success = await asyncio.to_thread(
             nest_api.set_temperature, temperature, thermo_state.device_id
@@ -556,11 +423,12 @@ async def execute_decision(decision: dict, thermo_state, weather_data, raw_respo
     return action
 
 
+# ── Mode switching ───────────────────────────────────────────────
+
 async def check_and_switch_mode(thermo_state, weather_data) -> str:
     """
     Check if HVAC mode needs to be switched based on forecast daily high.
     Returns the current/new mode as lowercase string ("heating", "cooling", etc).
-    This should be called BEFORE building LLM context so comfort ranges are correct.
 
     The daily high is locked on the first evaluation of each day to prevent
     mode flip-flopping as the rolling 24h forecast window shifts.
@@ -578,31 +446,26 @@ async def check_and_switch_mode(thermo_state, weather_data) -> str:
         logger.info("Daily high locked for %s: %.0fF", today, daily_high)
 
     desired_mode = "COOL" if daily_high >= 65 else "HEAT"
-    current_mode = thermo_state.mode  # "cooling", "heating", "auto", "off"
+    current_mode = thermo_state.mode
     mode_map = {"COOL": "cooling", "HEAT": "heating"}
 
     if current_mode != mode_map.get(desired_mode):
         logger.info("[%s] Switching HVAC mode to %s (daily high %.0fF)",
                     zone, desired_mode, daily_high)
         await asyncio.to_thread(nest_api.set_mode, desired_mode, thermo_state.device_id)
-        # Update the thermo_state object with the new mode
         thermo_state.mode = mode_map[desired_mode]
 
-        # Set temperature to the new mode's comfort zone.
-        # Without this, the old mode's target persists (e.g. cool target 75F
-        # becomes a heat target of 75F, overheating past winter range 68-72F).
-        comfort = _config.get("comfort", {})
+        # Set temperature to the new mode's comfort zone
         if desired_mode == "HEAT":
-            new_target = comfort.get("winter_range", [68, 72])[0]  # comfort low
+            new_target = 68  # Heating baseline low
         else:
-            new_target = comfort.get("summer_range", [75, 80])[0]  # comfort low
-        await asyncio.sleep(5)  # Let Nest propagate the mode change
+            new_target = 78  # Cooling default
+        await asyncio.sleep(5)
         await asyncio.to_thread(nest_api.set_temperature, new_target, thermo_state.device_id)
         thermo_state.target_temp = new_target
         logger.info("[%s] Set target to %.0fF for %s mode comfort zone",
                     zone, new_target, desired_mode)
 
-        # Send telegram notification for mode change
         await send_telegram(
             f"[{zone}] HVAC mode switched to {desired_mode} → target set to {new_target:.0f}F "
             f"(forecast daily high: {daily_high:.0f}F)"
@@ -610,6 +473,8 @@ async def check_and_switch_mode(thermo_state, weather_data) -> str:
 
     return thermo_state.mode
 
+
+# ── Weekly report ────────────────────────────────────────────────
 
 def generate_weekly_report() -> str:
     """Generate a Sunday summary from climate_log."""
@@ -639,36 +504,45 @@ def generate_weekly_report() -> str:
     return report
 
 
+# ── Evaluation cycle ─────────────────────────────────────────────
+
 async def run_evaluation_cycle() -> Optional[dict]:
     """
     Run one complete evaluation cycle for ALL thermostats.
-    Each zone gets its own LLM call with awareness of other zones.
-    Returns the last decision (for Telegram response).
+
+    Two paths:
+    - Autonomous (no user message): comfort model decides, no LLM needed
+    - User-triggered: LLM parses message, command applied, 30-min cooldown
     """
-    global _user_triggered, _last_user_request_time
+    global _user_triggered, _last_cooldown_time, _pending_user_text
     user_triggered = _user_triggered
-    _user_triggered = False  # Reset for next cycle
+    user_text = _pending_user_text
+    _user_triggered = False
+    _pending_user_text = None
     logger.info("Starting evaluation cycle (user_triggered=%s)", user_triggered)
 
-    # Back off after user requests — let the user's setting hold
-    if not user_triggered and _last_user_request_time is not None:
-        elapsed = (datetime.now() - _last_user_request_time).total_seconds() / 60
-        if elapsed < USER_REQUEST_BACKOFF_MINUTES:
-            remaining = int(USER_REQUEST_BACKOFF_MINUTES - elapsed)
-            logger.info("User request backoff: %d minutes remaining, skipping evaluation", remaining)
+    # Cooldown check — skip autonomous evaluation if within cooldown period
+    if not user_triggered and _last_cooldown_time is not None:
+        elapsed = (datetime.now() - _last_cooldown_time).total_seconds() / 60
+        if elapsed < USER_REQUEST_COOLDOWN_MINUTES:
+            remaining = int(USER_REQUEST_COOLDOWN_MINUTES - elapsed)
+            logger.info("Cooldown active: %d minutes remaining, skipping evaluation", remaining)
             return None
 
     last_decision = None
-    _cycle_decisions = []  # Track all zone decisions for summary
+    _cycle_decisions = []
 
     try:
+        # 0. ARP presence check (updates vacation mode before thermostat logic)
+        location.check_arp_presence()
+
         # 1. Get ALL thermostat states
         all_states = await asyncio.to_thread(nest_api.get_all_thermostat_states)
         for s in all_states:
             logger.info("[%s] %.1fF, %d%% humidity, mode=%s, target=%s",
                          s.name, s.indoor_temp, s.humidity, s.mode, s.target_temp)
 
-        # Check for manual overrides on each device
+        # 2. Check for manual overrides — triggers cooldown + learning
         for s in all_states:
             if nest_api.detect_manual_override(s.device_id, s.target_temp):
                 database.log_manual_override(
@@ -676,14 +550,21 @@ async def run_evaluation_cycle() -> Optional[dict]:
                     nest_api._last_known_targets.get(s.device_id, 0),
                     zone=s.name
                 )
-                logger.info("[%s] Manual override detected", s.name)
+                logger.info("[%s] Manual override detected → cooldown + learning", s.name)
+
+                # Get weather for learning
+                weather_data = await asyncio.to_thread(weather.get_weather)
+                _learn_from_override(s, weather_data, s.target_temp)
+
+                _last_cooldown_time = datetime.now()
                 await send_telegram(
                     f"[{s.name}] Manual override detected "
                     f"(target changed to {s.target_temp}F). "
                     f"Backing off for {MANUAL_OVERRIDE_BACKOFF_MINUTES} minutes."
                 )
+                return None  # Skip rest of evaluation
 
-        # 2. Get weather (shared across zones)
+        # 3. Get weather (shared across zones)
         weather_data = await asyncio.to_thread(weather.get_weather)
         logger.info("Weather: %.1fF, %d%% humidity, stale=%s",
                      weather_data.current_temp, weather_data.humidity, weather_data.is_stale)
@@ -694,118 +575,172 @@ async def run_evaluation_cycle() -> Optional[dict]:
             logger.warning("Weather alert: %s", alert)
             await send_telegram(f"Weather Alert: {alert}")
 
-        # 3. Start LLM server
-        server_started = await asyncio.to_thread(llm_server.start)
-        if not server_started:
-            logger.error("Failed to start LLM server — skipping evaluation")
-            database.log_error("llm_server", "start_failed", "Could not start llama-server")
-            return None
+        # ── Path A: User-triggered — LLM parses message ──
+        if user_triggered and user_text:
+            logger.info("User message: '%s' — starting LLM for NLP parse", user_text)
 
-        # 4-7. Evaluate each zone
-        for thermo_state in all_states:
-            zone = thermo_state.name
-            logger.info("[%s] Running LLM evaluation...", zone)
-
-            # Check and switch HVAC mode BEFORE building context (so comfort ranges are correct)
-            await check_and_switch_mode(thermo_state, weather_data)
-
-            # Build context with awareness of all zones
-            system_prompt = build_context(thermo_state, weather_data, all_states)
-            response_text, is_json = await asyncio.to_thread(call_llm, system_prompt)
-
-            if not is_json:
-                logger.error("[%s] LLM invalid JSON: %s", zone, response_text[:200])
-                database.log_error("llm", "invalid_json", f"[{zone}] {response_text[:500]}")
-                continue
-
-            is_valid, error_msg = validate_response(response_text)
-            if not is_valid:
-                logger.error("[%s] Validation failed: %s", zone, error_msg)
-                database.log_error("llm", "validation_failed", f"[{zone}] {error_msg}")
-                continue
-
-            decision = json.loads(response_text)
-
-            # Check guardrails
-            allowed, block_reason = check_guardrails(decision, user_triggered=user_triggered)
-            if not allowed:
-                logger.warning("[%s] Guardrail blocked: %s", zone, block_reason)
-                database.log_decision(
-                    indoor_temp=thermo_state.indoor_temp,
-                    outdoor_temp=weather_data.current_temp,
-                    action=f"BLOCKED:{decision['action']}",
-                    temperature=decision.get("temperature"),
-                    reasoning=f"BLOCKED: {block_reason} | Original: {decision.get('reasoning', '')}",
-                    raw_response=response_text,
-                    zone=zone
+            # Start LLM, parse, stop LLM
+            server_started = await asyncio.to_thread(llm_server.start)
+            if server_started:
+                command = await asyncio.to_thread(
+                    nlp_parser.parse, user_text, call_llm
                 )
-                continue
+                await asyncio.to_thread(llm_server.stop)
+            else:
+                # LLM failed — use regex fallback
+                logger.warning("LLM server failed to start — using regex fallback")
+                command = nlp_parser.parse(user_text)
 
-            # Execute
-            await execute_decision(decision, thermo_state, weather_data, response_text,
-                                   user_triggered=user_triggered)
-            decision["zone"] = zone
-            _cycle_decisions.append(decision)
-            last_decision = decision
+            logger.info("Parsed command: %s (temp=%s, zone=%s, dir=%s)",
+                        command.action_type, command.target_temp,
+                        command.zone, command.direction)
 
-            # Record user request time so regular evaluations back off
-            if user_triggered and decision["action"] == "set_temperature":
-                _last_user_request_time = datetime.now()
+            # Apply command
+            decisions = _apply_parsed_command(command, all_states, weather_data)
 
-            logger.info("[%s] Cycle complete: action=%s, temp=%s",
-                         zone, decision["action"], decision.get("temperature"))
+            for decision, thermo_state in decisions:
+                if thermo_state is None:
+                    continue
 
-        # 8. Stop LLM server to free GPU
-        await asyncio.to_thread(llm_server.stop)
+                # Check and switch mode first
+                await check_and_switch_mode(thermo_state, weather_data)
 
-        # 9. Update heartbeat
+                # Guardrails
+                allowed, block_reason = check_guardrails(decision, user_triggered=True)
+                if not allowed:
+                    logger.warning("[%s] Guardrail blocked: %s", thermo_state.name, block_reason)
+                    continue
+
+                # Execute
+                raw = json.dumps({"parsed": command.__dict__, "decision": decision})
+                await execute_decision(decision, thermo_state, weather_data, raw,
+                                       user_triggered=True)
+                decision["zone"] = thermo_state.name
+                _cycle_decisions.append(decision)
+                last_decision = decision
+
+                # Learn from user request
+                if decision["action"] == "set_temperature" and decision.get("temperature"):
+                    _learn_from_override(thermo_state, weather_data, decision["temperature"])
+
+            # Set cooldown
+            _last_cooldown_time = datetime.now()
+
+        # ── Path B: Autonomous — comfort model decides, NO LLM ──
+        else:
+            now = datetime.now()
+
+            for thermo_state in all_states:
+                zone = thermo_state.name
+                logger.info("[%s] Running comfort model evaluation...", zone)
+
+                # Check and switch HVAC mode
+                await check_and_switch_mode(thermo_state, weather_data)
+
+                # Get comfort model prediction
+                inp = _build_comfort_input(thermo_state, weather_data, now)
+                prediction = _comfort_model.predict(inp)
+
+                logger.info("[%s] Comfort model: target=%.0fF (baseline=%.0fF, corr=%.1f), "
+                            "should_change=%s",
+                            zone, prediction.target_temp, prediction.baseline_temp,
+                            prediction.correction, prediction.should_change)
+
+                if not prediction.should_change:
+                    decision = {
+                        "action": "no_change",
+                        "reasoning": prediction.reasoning,
+                    }
+                else:
+                    decision = {
+                        "action": "set_temperature",
+                        "temperature": prediction.target_temp,
+                        "reasoning": prediction.reasoning,
+                    }
+
+                # Guardrails
+                allowed, block_reason = check_guardrails(decision)
+                if not allowed:
+                    logger.warning("[%s] Guardrail blocked: %s", zone, block_reason)
+                    database.log_decision(
+                        indoor_temp=thermo_state.indoor_temp,
+                        outdoor_temp=weather_data.current_temp,
+                        action=f"BLOCKED:{decision['action']}",
+                        temperature=decision.get("temperature"),
+                        reasoning=f"BLOCKED: {block_reason} | {decision.get('reasoning', '')}",
+                        raw_response=json.dumps(prediction.__dict__),
+                        zone=zone
+                    )
+                    continue
+
+                # Execute
+                raw = json.dumps(prediction.__dict__)
+                await execute_decision(decision, thermo_state, weather_data, raw)
+                decision["zone"] = zone
+                _cycle_decisions.append(decision)
+                last_decision = decision
+
+                logger.info("[%s] Cycle complete: action=%s, temp=%s",
+                             zone, decision["action"], decision.get("temperature"))
+
+        # Update heartbeat
         database.update_heartbeat()
 
-        # 9. Send Telegram notifications
-        # Temperature changes
+        # Telegram notifications for temperature changes
         temp_changes = [d for d in _cycle_decisions if d["action"] == "set_temperature"]
-        if temp_changes:
+        if temp_changes and not user_triggered:
+            # Only send autonomous change notifications (user-triggered handled by telegram_bot)
             parts = []
             for d in temp_changes:
                 reason = d.get("reasoning", "")[:200]
                 parts.append(f"{d['zone']}: set to {d['temperature']:.0f}F — {reason}")
             await send_telegram("\n".join(parts))
 
-        # LLM message_to_user is only delivered for user-triggered cycles
-        # (handled by telegram_bot.handle_message). Don't send unsolicited
-        # LLM commentary during scheduled 20-min cycles.
-
         return last_decision
 
     except Exception as e:
         logger.error("Evaluation cycle failed: %s", e, exc_info=True)
         database.log_error("agent", type(e).__name__, str(e))
-        await asyncio.to_thread(llm_server.stop)
+        try:
+            await asyncio.to_thread(llm_server.stop)
+        except Exception:
+            pass
         return None
 
 
-def trigger_evaluation():
+def trigger_evaluation(user_text: Optional[str] = None):
     """Called by Telegram bot to wake the agent loop for an immediate evaluation."""
-    global _user_triggered, _user_message_eval_counter
+    global _user_triggered, _pending_user_text
     _user_triggered = True
-    _user_message_eval_counter = _evaluation_counter
-    logger.info("Evaluation triggered by user message (counter=%d)", _evaluation_counter)
+    _pending_user_text = user_text
+    logger.info("Evaluation triggered by user message: %s", (user_text or "")[:50])
 
+
+def get_last_evaluation_result() -> Optional[dict]:
+    """Get the result of the last evaluation cycle (for /status command)."""
+    return _last_evaluation_result
+
+
+def get_evaluation_counter() -> int:
+    """Get the evaluation counter (for detecting new cycles)."""
+    return _evaluation_counter
+
+
+# ── Agent loop ───────────────────────────────────────────────────
 
 async def agent_loop():
     """
-    Main async loop — runs evaluation every N minutes or when triggered.
-    Uses asyncio.Event for event-based interruption.
+    Main async loop — runs evaluation every 30 minutes or when triggered.
     """
     global _last_evaluation_result, _evaluation_counter, _user_triggered
 
-    normal_interval = _config["agent"]["loop_interval_minutes"] * 60
+    normal_interval = EVAL_INTERVAL_MINUTES * 60
 
-    logger.info("Agent loop starting (normal interval: %d minutes)", normal_interval // 60)
+    logger.info("Agent loop starting (interval: %d minutes)", normal_interval // 60)
 
     # Wait for Telegram bot to register its send function
     logger.info("Waiting for Telegram bot to initialize...")
-    for i in range(15):  # Up to 30 seconds (should be <5s now)
+    for i in range(15):
         if _telegram_send_fn is not None:
             logger.info("Telegram bot ready (took %ds)", (i + 1) * 2)
             break
@@ -815,16 +750,13 @@ async def agent_loop():
 
     # Weekly report day check
     last_report_day = None
-
-    # Daily cleanup
     last_cleanup_day = None
 
     while True:
         try:
-            # Run evaluation
             result = await asyncio.wait_for(
                 run_evaluation_cycle(),
-                timeout=300  # 5-minute max per cycle
+                timeout=300
             )
             _last_evaluation_result = result
             _evaluation_counter += 1
@@ -853,7 +785,7 @@ async def agent_loop():
             logger.info("Trigger received during cycle — running again immediately")
             continue
 
-        # Compute interval: longer during vacation mode to save energy
+        # Compute interval: longer during vacation mode
         if location.is_vacation_mode():
             interval_seconds = location.get_vacation_eval_interval_minutes() * 60
         else:
@@ -870,16 +802,6 @@ async def agent_loop():
                 break
 
 
-def get_last_evaluation_result() -> Optional[dict]:
-    """Get the result of the last evaluation cycle (for /status command)."""
-    return _last_evaluation_result
-
-
-def get_evaluation_counter() -> int:
-    """Get the evaluation counter (for detecting new cycles)."""
-    return _evaluation_counter
-
-
 async def _on_vacation_mode_change(is_vacation: bool):
     """Callback fired by location module when vacation mode transitions."""
     if is_vacation:
@@ -891,14 +813,13 @@ async def _on_vacation_mode_change(is_vacation: bool):
     else:
         msg = (f"Vacation mode DEACTIVATED — welcome home!\n"
                f"Restoring normal comfort range ({TEMP_MIN_NORMAL}-{TEMP_MAX_NORMAL}F), "
-               f"eval interval → {_config['agent']['loop_interval_minutes']} min.")
+               f"eval interval → {EVAL_INTERVAL_MINUTES} min.")
     logger.info(msg)
     await send_telegram(msg)
 
 
 async def main():
     """Entry point — init all modules, run agent loop + Telegram bot."""
-    # Load config
     config = load_config()
 
     # Setup logging
@@ -923,7 +844,7 @@ async def main():
     nest_api.init_nest(config["nest"]["tokens_path"],
                        devices=config["nest"].get("devices"))
 
-    # Init LLM server manager (doesn't start the server yet)
+    # Init LLM server manager (for NLP parsing only — not started until needed)
     llm_cfg = config["llm"]
     llm_port = int(llm_cfg["endpoint"].split(":")[-1].split("/")[0])
     llm_server.init(
@@ -931,6 +852,9 @@ async def main():
         model_path=llm_cfg["model_path"],
         port=llm_port
     )
+
+    # Init comfort model (replaces LLM for autonomous decisions)
+    init_comfort_model(config)
 
     # Init location tracking (OwnTracks)
     location.init_location(config)
@@ -942,15 +866,10 @@ async def main():
 
     logger.info("All modules initialized. Starting agent loop + Telegram bot.")
 
-    # Run agent loop, Telegram bot, and MQTT location loop concurrently
-    tasks = [
+    await asyncio.gather(
         agent_loop(),
         telegram_bot.start_bot(),
-    ]
-    if config.get("owntracks", {}).get("enabled", False):
-        tasks.append(location.mqtt_loop())
-
-    await asyncio.gather(*tasks)
+    )
 
 
 if __name__ == "__main__":

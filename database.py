@@ -374,3 +374,76 @@ def cleanup_old_records(retention_days: int = 90):
         logger.info("Cleaned up records older than %d days", retention_days)
     finally:
         conn.close()
+
+
+# ── Training data queries (for comfort model) ───────────────────
+
+def get_manual_overrides_with_context() -> list:
+    """Get manual overrides joined with nearest climate_log row for model training."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT
+                mo.timestamp,
+                mo.zone,
+                mo.detected_target,
+                mo.previous_target,
+                cl.indoor_temp,
+                cl.indoor_humidity,
+                cl.outdoor_temp,
+                cl.outdoor_humidity,
+                cl.hvac_mode,
+                cl.hvac_running
+            FROM manual_overrides mo
+            LEFT JOIN climate_log cl ON cl.id = (
+                SELECT id FROM climate_log
+                WHERE timestamp <= mo.timestamp
+                ORDER BY timestamp DESC LIMIT 1
+            )
+            ORDER BY mo.timestamp
+        """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_messages_with_context() -> list:
+    """Get messages joined with nearest climate_log row for model training."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT
+                m.timestamp,
+                m.text,
+                m.agent_response,
+                cl.indoor_temp,
+                cl.outdoor_temp,
+                cl.hvac_mode,
+                cl.target_temp
+            FROM messages m
+            LEFT JOIN climate_log cl ON cl.id = (
+                SELECT id FROM climate_log
+                WHERE timestamp <= m.timestamp
+                ORDER BY timestamp DESC LIMIT 1
+            )
+            ORDER BY m.timestamp
+        """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_all_climate_data() -> list:
+    """Get all climate_log entries for zone offset training."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT timestamp, zone, indoor_temp, outdoor_temp, indoor_humidity,
+                   hvac_mode, hvac_running, target_temp
+            FROM climate_log
+            WHERE indoor_temp IS NOT NULL
+            ORDER BY timestamp ASC
+        """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()

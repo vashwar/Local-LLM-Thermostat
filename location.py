@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-OwnTracks location module for the AI Thermostat Agent.
-Tracks phone locations via MQTT and manages vacation mode.
+ARP-based presence detection for the AI Thermostat Agent.
+Scans the Windows ARP table for known phone MAC addresses to determine
+if anyone is home. Manages vacation mode based on consecutive misses.
 Pattern follows weather.py / nest_api.py: module-level state, init function, getters.
 """
 
 import asyncio
-import json
 import logging
 import math
+import subprocess
 import time
 from typing import Optional, Callable
 
@@ -18,24 +19,18 @@ logger = logging.getLogger(__name__)
 
 # ── Module-level state ────────────────────────────────────────────
 _enabled: bool = False
-_broker_host: str = "localhost"
-_broker_port: int = 1883
-_broker_user: Optional[str] = None
-_broker_pass: Optional[str] = None
-_topics: list = []
-_geofence_miles: float = 30.0
-_stale_hours: float = 12.0
+_phone_macs: list = []
 _vacation_temp_min: int = 60
 _vacation_temp_max: int = 85
 _vacation_eval_interval_minutes: int = 60
 
-_home_lat: float = 0.0
-_home_lon: float = 0.0
-
-_phone_locations: dict = {}  # topic -> {lat, lon, miles_from_home, last_update}
 _vacation_mode: bool = False
 _vacation_change_callback: Optional[Callable] = None
 _initialized: bool = False
+
+# ARP presence state
+_consecutive_misses: int = 0
+_required_misses: int = 2
 
 
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -52,38 +47,33 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def init_location(config: dict):
-    """Initialize location tracking from config. Call once at startup."""
-    global _enabled, _broker_host, _broker_port, _broker_user, _broker_pass
-    global _topics, _geofence_miles, _stale_hours
+    """Initialize presence detection from config. Call once at startup."""
+    global _enabled, _phone_macs, _required_misses
     global _vacation_temp_min, _vacation_temp_max, _vacation_eval_interval_minutes
-    global _home_lat, _home_lon, _initialized
+    global _initialized, _consecutive_misses
 
-    ot = config.get("owntracks", {})
-    _enabled = ot.get("enabled", False)
+    presence = config.get("presence", {})
+    _phone_macs = [mac.lower() for mac in presence.get("phone_macs", [])]
+    _required_misses = presence.get("consecutive_misses", 2)
+    _enabled = len(_phone_macs) > 0
 
     if not _enabled:
-        logger.info("OwnTracks location tracking disabled")
+        logger.info("ARP presence detection disabled (no phone_macs configured)")
         return
 
-    _broker_host = ot.get("broker_host", "localhost")
-    _broker_port = ot.get("broker_port", 1883)
-    _broker_user = ot.get("broker_user")
-    _broker_pass = ot.get("broker_pass")
-    _topics = ot.get("topics", [])
-    _geofence_miles = ot.get("geofence_miles", 30.0)
-    _stale_hours = ot.get("stale_hours", 12.0)
-    _vacation_temp_min = ot.get("vacation_temp_min", 60)
-    _vacation_temp_max = ot.get("vacation_temp_max", 85)
-    _vacation_eval_interval_minutes = ot.get("vacation_eval_interval_minutes", 60)
+    # Vacation settings (can come from presence or owntracks for backward compat)
+    ot = config.get("owntracks", {})
+    _vacation_temp_min = presence.get("vacation_temp_min", ot.get("vacation_temp_min", 60))
+    _vacation_temp_max = presence.get("vacation_temp_max", ot.get("vacation_temp_max", 85))
+    _vacation_eval_interval_minutes = presence.get(
+        "vacation_eval_interval_minutes",
+        ot.get("vacation_eval_interval_minutes", 60)
+    )
 
-    # Home coordinates from weather config
-    weather_cfg = config.get("weather", {})
-    _home_lat = weather_cfg.get("latitude", 0.0)
-    _home_lon = weather_cfg.get("longitude", 0.0)
-
+    _consecutive_misses = 0
     _initialized = True
-    logger.info("OwnTracks initialized: %d topics, geofence=%.0f mi, home=(%.4f, %.4f)",
-                len(_topics), _geofence_miles, _home_lat, _home_lon)
+    logger.info("ARP presence initialized: %d MACs, required_misses=%d",
+                len(_phone_macs), _required_misses)
 
 
 def is_vacation_mode() -> bool:
@@ -106,111 +96,113 @@ def get_vacation_eval_interval_minutes() -> int:
     return _vacation_eval_interval_minutes
 
 
-def get_phone_locations() -> dict:
-    """Return current phone location data for status display."""
-    return dict(_phone_locations)
-
-
 def set_vacation_change_callback(fn: Callable):
     """Register an async callback for vacation mode transitions. fn(is_vacation: bool)."""
     global _vacation_change_callback
     _vacation_change_callback = fn
 
 
-def _on_mqtt_message(topic: str, payload: bytes):
-    """Process an incoming OwnTracks MQTT message."""
-    global _phone_locations
+def _run_arp() -> str:
+    """Run 'arp -a' and return its stdout. Separated for testability."""
+    result = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10)
+    return result.stdout
 
+
+def _parse_arp_ip_for_mac(arp_output: str, mac: str) -> str | None:
+    """Find the IP address associated with a MAC in the ARP output. Returns None if not found."""
+    mac_stripped = mac.replace(":", "").replace("-", "").lower()
+    for line in arp_output.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            line_mac = parts[1].replace("-", "").replace(":", "").lower()
+            if line_mac == mac_stripped:
+                return parts[0]
+    return None
+
+
+def _ping_check(ip: str) -> bool:
+    """Ping an IP 3 times. Returns True if any reply is received."""
     try:
-        data = json.loads(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        logger.warning("Invalid JSON from %s", topic)
-        return
-
-    # OwnTracks location messages have _type: "location"
-    if data.get("_type") != "location":
-        return
-
-    lat = data.get("lat")
-    lon = data.get("lon")
-    if lat is None or lon is None:
-        return
-
-    miles = _haversine(_home_lat, _home_lon, lat, lon)
-
-    _phone_locations[topic] = {
-        "lat": lat,
-        "lon": lon,
-        "miles_from_home": round(miles, 1),
-        "last_update": time.time(),
-    }
-
-    logger.info("Location update [%s]: (%.4f, %.4f) — %.1f mi from home",
-                topic, lat, lon, miles)
-
-    try:
-        database.log_location_event("location_update", topic, lat, lon, miles, _vacation_mode)
+        result = subprocess.run(
+            ["ping", "-n", "3", "-w", "1000", ip],
+            capture_output=True, text=True, timeout=10
+        )
+        # Windows ping returns 0 if any reply received
+        return result.returncode == 0
     except Exception:
-        pass  # DB not initialized (e.g. in tests)
-
-    _evaluate_vacation_mode()
+        return False
 
 
-def _evaluate_vacation_mode():
-    """Evaluate whether vacation mode should change based on current phone locations."""
+def check_arp_presence():
+    """
+    Check if known phones are actually on the network. Called by agent each eval cycle.
+
+    1. Read ARP table for known MACs to find their IPs
+    2. Ping each found IP to verify the device is actually reachable
+       (stale ARP cache entries will fail the ping)
+    3. Any phone reachable → someone home → vacation OFF (immediate)
+    4. No phones reachable → increment consecutive misses
+    5. Required consecutive misses reached → vacation ON
+    """
+    global _consecutive_misses
+
+    if not _enabled:
+        return
+
+    try:
+        arp_output = _run_arp()
+    except Exception as e:
+        logger.error("ARP scan failed: %s", e)
+        return
+
+    # Find IPs for known MACs, then ping to verify they're actually reachable
+    reachable_macs = []
+    for mac in _phone_macs:
+        ip = _parse_arp_ip_for_mac(arp_output, mac)
+        if ip and _ping_check(ip):
+            reachable_macs.append(mac)
+            logger.debug("ARP: %s (%s) is reachable", mac, ip)
+        elif ip:
+            logger.debug("ARP: %s (%s) in cache but ping failed — stale entry", mac, ip)
+
+    if reachable_macs:
+        # Someone is home
+        _consecutive_misses = 0
+        logger.info("ARP: %d/%d phone(s) reachable on network", len(reachable_macs), len(_phone_macs))
+
+        try:
+            database.log_location_event("arp_detected", ",".join(reachable_macs), 0, 0, 0, _vacation_mode)
+        except Exception:
+            pass
+
+        _set_vacation(False)
+    else:
+        # No phones reachable
+        _consecutive_misses += 1
+        logger.info("ARP: no phones reachable (miss %d/%d)", _consecutive_misses, _required_misses)
+
+        try:
+            database.log_location_event("arp_miss", f"miss_{_consecutive_misses}", 0, 0, 0, _vacation_mode)
+        except Exception:
+            pass
+
+        if _consecutive_misses >= _required_misses:
+            _set_vacation(True)
+
+
+def _set_vacation(active: bool):
+    """Set vacation mode and fire callback if changed."""
     global _vacation_mode
 
-    if not _topics:
-        return
-
-    now = time.time()
-    stale_threshold = _stale_hours * 3600
-
-    phones_away = 0
-    phones_home = 0
-    phones_stale = 0
-    phones_with_data = 0
-
-    for topic in _topics:
-        loc = _phone_locations.get(topic)
-        if loc is None:
-            # No data for this phone — counts as neither away nor home
-            continue
-
-        phones_with_data += 1
-        age = now - loc["last_update"]
-
-        if age > stale_threshold:
-            phones_stale += 1
-            phones_home += 1  # Stale = assume home (safer default)
-            continue
-
-        if loc["miles_from_home"] > _geofence_miles:
-            phones_away += 1
-        else:
-            phones_home += 1
-
-    # Fail-safe: if no phone has any data at all, vacation stays OFF
-    if phones_with_data == 0:
-        return
-
     old_mode = _vacation_mode
-
-    if phones_home > 0:
-        # Any phone home → vacation OFF
-        _vacation_mode = False
-    elif phones_away > 0 and phones_home == 0:
-        # All non-stale phones are away → vacation ON
-        _vacation_mode = True
-    # else: all stale, keep current
+    _vacation_mode = active
 
     if _vacation_mode != old_mode:
-        logger.info("Vacation mode changed: %s → %s (away=%d, home=%d, stale=%d)",
-                    old_mode, _vacation_mode, phones_away, phones_home, phones_stale)
+        logger.info("Vacation mode changed: %s → %s", old_mode, _vacation_mode)
         try:
             database.log_location_event("vacation_change", "", 0, 0, 0, _vacation_mode)
         except Exception:
-            pass  # DB not initialized (e.g. in tests)
+            pass
         if _vacation_change_callback:
             try:
                 loop = asyncio.get_event_loop()
@@ -220,61 +212,3 @@ def _evaluate_vacation_mode():
                     loop.run_until_complete(_vacation_change_callback(_vacation_mode))
             except Exception as e:
                 logger.error("Vacation change callback failed: %s", e)
-
-
-async def mqtt_loop():
-    """Async task: connect to Mosquitto, subscribe to OwnTracks topics, process messages."""
-    if not _enabled:
-        logger.info("OwnTracks MQTT loop disabled — exiting")
-        return
-
-    try:
-        import paho.mqtt.client as mqtt
-    except ImportError:
-        logger.error("paho-mqtt not installed — OwnTracks disabled. pip install paho-mqtt")
-        return
-
-    while True:
-        try:
-            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-
-            if _broker_user:
-                client.username_pw_set(_broker_user, _broker_pass)
-
-            def on_connect(client, userdata, flags, reason_code, properties=None):
-                if reason_code == 0:
-                    logger.info("Connected to MQTT broker %s:%d", _broker_host, _broker_port)
-                    for topic in _topics:
-                        client.subscribe(topic)
-                        logger.info("Subscribed to %s", topic)
-                else:
-                    logger.error("MQTT connection failed: %s", reason_code)
-
-            def on_message(client, userdata, msg):
-                logger.info("MQTT raw message on %s (%d bytes)", msg.topic, len(msg.payload))
-                _on_mqtt_message(msg.topic, msg.payload)
-
-            def on_disconnect(client, userdata, flags, reason_code, properties=None):
-                logger.warning("MQTT disconnected (reason=%s), will retry...", reason_code)
-
-            client.on_connect = on_connect
-            client.on_message = on_message
-            client.on_disconnect = on_disconnect
-
-            client.connect(_broker_host, _broker_port, keepalive=60)
-            client.loop_start()
-
-            # Wait for connection to establish
-            await asyncio.sleep(2)
-
-            # Keep running until disconnected
-            while client.is_connected():
-                await asyncio.sleep(5)
-
-            client.loop_stop()
-
-        except Exception as e:
-            logger.error("MQTT error: %s — retrying in 30s", e)
-
-        # Retry delay
-        await asyncio.sleep(30)

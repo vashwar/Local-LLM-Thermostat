@@ -55,3 +55,17 @@ tmp/
 test_output/
 testHarness/
 TODOproduct.md
+
+# MQTT (deprecated)
+mosquitto_local.conf
+mqtt_passwd
+test_mqtt.py
+
+# DuckDNS
+update_duckdns.bat
+
+# Comfort model state (regenerated at runtime)
+comfort_corrections.json
+
+# gstack internal
+.gstack/
