@@ -64,19 +64,19 @@ class TestBaseline:
         assert "extreme heat" in pred.reasoning.lower() or "pre-cool" in pred.reasoning.lower()
 
     def test_precool_before_bed(self):
-        """9:30-10:30 PM → pre-cool to 75F."""
-        pred = self.model.predict(_inp(hour=21, minute=30))
+        """10:00-11:00 PM → pre-cool to 75F."""
+        pred = self.model.predict(_inp(hour=22, minute=0))
         assert pred.baseline_temp == 75
         assert "pre-cool" in pred.reasoning.lower()
 
-    def test_precool_at_10pm(self):
-        """10:00 PM is still in pre-cool window."""
-        pred = self.model.predict(_inp(hour=22, minute=0))
+    def test_precool_at_1030pm(self):
+        """10:30 PM is still in pre-cool window."""
+        pred = self.model.predict(_inp(hour=22, minute=30))
         assert pred.baseline_temp == 75
 
-    def test_sleep_after_1030pm(self):
-        """After 10:30 PM → sleep target 78F."""
-        pred = self.model.predict(_inp(hour=22, minute=30))
+    def test_sleep_after_11pm(self):
+        """After 11:00 PM → sleep target 78F."""
+        pred = self.model.predict(_inp(hour=23, minute=0))
         assert pred.baseline_temp == 78
         assert "sleep" in pred.reasoning.lower()
 
@@ -342,20 +342,20 @@ class TestIntegration:
         """Verify exact pre-cool window boundaries."""
         model = ComfortModel()
 
-        # 9:29 PM → normal (not pre-cool)
-        pred = model.predict(_inp(hour=21, minute=29, outdoor=85))
+        # 9:59 PM → normal (not pre-cool)
+        pred = model.predict(_inp(hour=21, minute=59, outdoor=85))
         assert pred.baseline_temp == 78
 
-        # 9:30 PM → pre-cool starts
-        pred = model.predict(_inp(hour=21, minute=30, outdoor=85))
+        # 10:00 PM → pre-cool starts
+        pred = model.predict(_inp(hour=22, minute=0, outdoor=85))
         assert pred.baseline_temp == 75
 
-        # 10:29 PM → still pre-cool
-        pred = model.predict(_inp(hour=22, minute=29, outdoor=85))
+        # 10:59 PM → still pre-cool
+        pred = model.predict(_inp(hour=22, minute=59, outdoor=85))
         assert pred.baseline_temp == 75
 
-        # 10:30 PM → sleep target
-        pred = model.predict(_inp(hour=22, minute=30, outdoor=85))
+        # 11:00 PM → sleep target
+        pred = model.predict(_inp(hour=23, minute=0, outdoor=85))
         assert pred.baseline_temp == 78
 
     def test_heating_full_range(self):

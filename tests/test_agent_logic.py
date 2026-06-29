@@ -601,21 +601,21 @@ class TestAgentComfortPredictions:
         assert pred.baseline_temp == 75
 
     def test_precool_before_bed_75(self):
-        """9:30 PM → pre-cool to 75F."""
+        """10:00 PM → pre-cool to 75F."""
         state = _make_thermo_state(mode="cooling", indoor_temp=78.0, target_temp=78.0)
         weather_data = _make_weather(current_temp=85.0)
-        now = datetime(2025, 7, 15, 21, 30)
+        now = datetime(2025, 7, 15, 22, 0)
 
         inp = agent._build_comfort_input(state, weather_data, now)
         pred = agent._comfort_model.predict(inp)
 
         assert pred.baseline_temp == 75
 
-    def test_sleep_after_1030pm_78(self):
-        """After 10:30 PM → sleep target 78F."""
+    def test_sleep_after_11pm_78(self):
+        """After 11:00 PM → sleep target 78F."""
         state = _make_thermo_state(mode="cooling", indoor_temp=76.0, target_temp=75.0)
         weather_data = _make_weather(current_temp=85.0)
-        now = datetime(2025, 7, 15, 22, 30)
+        now = datetime(2025, 7, 15, 23, 0)
 
         inp = agent._build_comfort_input(state, weather_data, now)
         pred = agent._comfort_model.predict(inp)

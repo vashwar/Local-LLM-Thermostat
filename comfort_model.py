@@ -89,34 +89,55 @@ def _normalize_zone(zone_name: str) -> str:
 class ComfortModel:
     """Two-layer predictive comfort model."""
 
-    # Layer 1 defaults
-    COOL_DEFAULT = 78.0          # Default cooling target
-    COOL_PRECOOL = 75.0          # Pre-cool target for extreme heat
-    COOL_PRECOOL_BED = 75.0      # Pre-cool target before bed (9:30-10:30 PM)
-    SLEEP_TARGET = 78.0          # Sleep target (after 10:30 PM)
-    HEAT_COLD = 72.0             # Heating target in extreme cold
-    HEAT_MILD = 68.0             # Heating target approaching 65F
+    # Layer 1 defaults (overridable via config)
     VACATION_COOL = 82.0         # Vacation cooling ceiling
     VACATION_HEAT = 60.0         # Vacation heating floor
-
-    # Pre-cool window
-    PRECOOL_START_HOUR = 21      # 9 PM
-    PRECOOL_START_MIN = 30       # 9:30 PM
-    PRECOOL_END_HOUR = 22        # 10 PM
-    PRECOOL_END_MIN = 30         # 10:30 PM
-
-    # Sleep window: after pre-cool end through 7 AM
-    SLEEP_START_HOUR = 22
-    SLEEP_START_MIN = 30
-    WAKE_HOUR = 7
 
     # Layer 2
     EMA_ALPHA = 0.3              # Exponential moving average blend factor
 
-    def __init__(self, deadband_f: float = 2.0, zone_offsets: Optional[dict] = None):
+    def __init__(self, deadband_f: float = 2.0, zone_offsets: Optional[dict] = None,
+                 summer_range: Optional[list] = None, winter_range: Optional[list] = None,
+                 sleep_time: str = "23:00", wake_time: str = "07:00",
+                 precool_time: Optional[str] = None,
+                 sleep_cool_temp: Optional[float] = None):
         self.deadband_f = deadband_f
-        self.zone_offsets: dict = zone_offsets or {}  # {"upstairs": -1.0, "downstairs": 0.0}
-        self.corrections: dict = {}  # bucket_key -> correction_F
+        self.zone_offsets: dict = zone_offsets or {}
+        self.corrections: dict = {}
+
+        # Summer/winter targets from config
+        sr = summer_range or [75, 80]
+        wr = winter_range or [68, 72]
+        self.COOL_DEFAULT = float(sr[1]) - 2.0     # Default cooling (78 from [75,80])
+        self.COOL_PRECOOL = float(sr[0])            # Pre-cool for extreme heat (75)
+        self.SLEEP_TARGET = float(sr[1]) - 2.0      # Sleep target (78)
+        self.HEAT_MILD = float(wr[0])               # Heating mild (68)
+        self.HEAT_COLD = float(wr[1])               # Heating extreme cold (72)
+
+        # Pre-cool before bed temp
+        self.COOL_PRECOOL_BED = float(sleep_cool_temp) if sleep_cool_temp is not None else self.COOL_PRECOOL
+
+        # Sleep/wake schedule from config
+        sleep_h, sleep_m = (int(x) for x in sleep_time.split(":"))
+        wake_h, wake_m = (int(x) for x in wake_time.split(":"))
+
+        # Pre-cool start: explicit config or default 1 hour before sleep
+        if precool_time:
+            pc_h, pc_m = (int(x) for x in precool_time.split(":"))
+        else:
+            precool_total = sleep_h * 60 + sleep_m - 60
+            if precool_total < 0:
+                precool_total += 24 * 60
+            pc_h = precool_total // 60
+            pc_m = precool_total % 60
+
+        self.PRECOOL_START_HOUR = pc_h
+        self.PRECOOL_START_MIN = pc_m
+        self.PRECOOL_END_HOUR = sleep_h
+        self.PRECOOL_END_MIN = sleep_m
+        self.SLEEP_START_HOUR = sleep_h
+        self.SLEEP_START_MIN = sleep_m
+        self.WAKE_HOUR = wake_h
 
     # ── Layer 1: ASHRAE Adaptive Baseline ────────────────────────
 

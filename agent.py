@@ -163,8 +163,18 @@ def init_comfort_model(config: dict):
     """Initialize and train the comfort model on startup."""
     global _comfort_model
     cm_cfg = config.get("comfort_model", {})
-    deadband = cm_cfg.get("deadband_f", 2.0)
-    _comfort_model = ComfortModel(deadband_f=deadband)
+    comfort = config.get("comfort", {})
+    schedule = config.get("schedule", {})
+
+    _comfort_model = ComfortModel(
+        deadband_f=cm_cfg.get("deadband_f", 2.0),
+        summer_range=comfort.get("summer_range", [75, 80]),
+        winter_range=comfort.get("winter_range", [68, 72]),
+        sleep_time=schedule.get("sleep_time", "23:00"),
+        wake_time=schedule.get("wake_time", "07:00"),
+        precool_time=schedule.get("precool_time"),
+        sleep_cool_temp=comfort.get("sleep_cool_temp"),
+    )
 
     # Load saved corrections
     corrections_path = cm_cfg.get("corrections_path", "comfort_corrections.json")
