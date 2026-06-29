@@ -185,7 +185,7 @@ def init_comfort_model(config: dict):
         _run_initial_training()
 
     logger.info("Comfort model initialized (deadband=%.1fF, corrections=%d)",
-                deadband, len(_comfort_model.corrections))
+                _comfort_model.deadband_f, len(_comfort_model.corrections))
 
 
 def _run_initial_training():
@@ -629,9 +629,14 @@ async def run_evaluation_cycle() -> Optional[dict]:
                 _cycle_decisions.append(decision)
                 last_decision = decision
 
-                # Learn from user request
+                # Learn from user request + log to manual_overrides for startup replay
                 if decision["action"] == "set_temperature" and decision.get("temperature"):
                     _learn_from_override(thermo_state, weather_data, decision["temperature"])
+                    database.log_manual_override(
+                        decision["temperature"],
+                        thermo_state.target_temp,
+                        zone=thermo_state.name
+                    )
 
             # Set cooldown
             _last_cooldown_time = datetime.now()

@@ -8,26 +8,25 @@ I built a local AI agent that manages my home's two Nest thermostats autonomousl
 
 ## How It Works
 
-Every 20 minutes, the agent runs an evaluation cycle. Python does 90% of the reasoning (time period, comfort range, forecast analysis, zone routing) and compresses it into a ~200-token directive. The SLM makes the final call and generates a human-readable explanation. Hard-coded guardrails in Python enforce safety before any action reaches the Nest API.
+Every 5 minutes, the agent runs an evaluation cycle. A two-layer comfort model (ASHRAE-inspired baseline + learned corrections from manual overrides) handles autonomous decisions. The SLM is only invoked for natural language parsing when a user sends a Telegram message. Hard-coded guardrails in Python enforce safety before any action reaches the Nest API.
 
 ```
 start.bat
   └─> python agent.py
         └─> asyncio.gather(
-              agent_loop(),              # 20-min scheduled evaluation
+              agent_loop(),              # 5-min scheduled evaluation
               telegram_bot.start_bot()   # Telegram polling
             )
 
 Single Evaluation Cycle:
-  1. Read indoor temp/humidity from Nest API (per zone)
-  2. Read outdoor weather + forecast from Open-Meteo
-  3. Read recent Telegram messages for user requests
-  4. Start llama-server (on-demand, GPU)
-  5. Python pre-processes context → compact directive for SLM
-  6. SLM returns JSON decision → validated against guardrails
+  1. Check ARP table + ping for phone presence (vacation detection)
+  2. Read indoor temp/humidity from Nest API (per zone)
+  3. Read outdoor weather + forecast from Open-Meteo
+  4. Comfort model predicts target temp (baseline + zone offsets + learned corrections)
+  5. If user sent a Telegram message → start llama-server, parse with SLM
+  6. Validate decision against guardrails
   7. Execute temperature change via Nest API (if needed)
-  8. Stop llama-server (free GPU memory)
-  9. Log everything to SQLite
+  8. Log everything to SQLite
 ```
 
 When you send a Telegram message, the agent immediately runs an extra evaluation cycle with your request as priority context.
@@ -39,10 +38,12 @@ When you send a Telegram message, the agent immediately runs an extra evaluation
 - **On-demand LLM** — llama-server starts only during evaluations, then shuts down to free GPU memory
 - **Telegram bot** — send natural language commands ("set upstairs to 78"), get status, export data
 - **User requests are priority** — the AI always follows your explicit instructions over its own logic
-- **Vacation mode** — OwnTracks presence detection via MQTT; sets 85F (cool) / 60F (heat) when everyone is away
+- **Predictive comfort model** — two-layer engine: ASHRAE-inspired adaptive baseline + learned corrections from your manual overrides
+- **Vacation mode** — ARP+ping presence detection on your local network; sets 82F (cool) / 60F (heat) when all phones leave
 - **Safety guardrails** — hard-coded temp bounds (65-80F normal, 60-85F vacation), rate limiting, manual override detection
 - **Weather-aware** — Open-Meteo primary (true daily high/low, hourly resolution), OWM fallback
 - **Schedule-aware** — knows sleep/wake times, adjusts comfort ranges by season and HVAC mode
+- **Config-driven schedule** — sleep/wake times, pre-cool window, summer/winter temp ranges all in `config.yaml`
 - **SLM-optimized** — Python pre-processes all reasoning into a ~200-token prompt, respecting the 4096 context window
 - **Benchmarked** — 59-scenario test harness validated both Qwen 4B and Gemma 4 E2B at 94.9% accuracy
 - **Climate logging** — full SQLite history for analysis and weekly reports
@@ -64,7 +65,7 @@ When you send a Telegram message, the agent immediately runs an extra evaluation
 1. Download a prebuilt release from [llama.cpp releases](https://github.com/ggerganov/llama.cpp/releases) (pick the CUDA/Vulkan version matching your GPU)
 2. Extract `llama-server.exe` to a folder on your system (e.g., `C:\llama-cpp\llama-server.exe`)
 3. Download a GGUF model — Gemma 4 E2B (recommended, lighter) or Qwen 4B from [HuggingFace](https://huggingface.co/)
-4. Note the full paths to both files — you'll add them to `config.yaml` in Step 5
+4. Note the full paths to both files — you'll add them to `config.yaml` in Step 6
 
 ### Step 2: Get Nest API Access
 
@@ -137,7 +138,16 @@ This saves your tokens to `nest_tokens.json` and lists your devices. Note the **
 2. The agent uses [Open-Meteo](https://open-meteo.com/) as its primary weather source — no API key needed
 3. (Optional) For fallback weather, create a free [OpenWeatherMap](https://openweathermap.org/api) account and copy your API key
 
-### Step 4: Create a Telegram Bot
+### Step 4: Find Your Phone MAC Addresses
+
+For vacation mode (automatic away detection), you need the Wi-Fi MAC addresses of phones in your household.
+
+1. On **iPhone**: Go to **Settings > Wi-Fi** > tap the (i) next to your home network > copy the **Wi-Fi Address** (this is the private MAC — it stays stable for that network)
+2. On **Android**: Go to **Settings > About Phone > Status > Wi-Fi MAC address**
+3. You can also run `arp -a` from a command prompt while the phones are connected to find their MACs
+4. Note down each MAC address — you'll add them to `config.yaml` in Step 6
+
+### Step 5: Create a Telegram Bot
 
 1. Open Telegram and search for **@BotFather**
 2. Send `/newbot`
@@ -153,14 +163,14 @@ This saves your tokens to `nest_tokens.json` and lists your devices. Note the **
    - Check `getUpdates` again for their chat IDs
    - Add all chat IDs to the whitelist in `config.yaml`
 
-### Step 5: Configure
+### Step 6: Configure
 
 Edit `config.yaml` with your values:
 
 ```yaml
 llm:
   server_exe: "C:\\path\\to\\llama-server.exe"         # Full path to llama-server executable
-  model_path: "C:\\path\\to\\model.gguf"               # Full path to Qwen 4B GGUF model
+  model_path: "C:\\path\\to\\model.gguf"               # Full path to GGUF model
   endpoint: "http://localhost:8080/v1/chat/completions"
   model: "gemma-4-e2b"
   temperature: 0.3
@@ -177,7 +187,7 @@ nest:
       device_id: "enterprises/YOUR_PROJECT_ID/devices/YOUR_DEVICE_ID"
 
 weather:
-  api_key: "YOUR_OPENWEATHERMAP_API_KEY"
+  api_key: "YOUR_OPENWEATHERMAP_API_KEY"   # Optional — Open-Meteo is primary (no key needed)
   latitude: 33.0198
   longitude: -96.6989
   cache_minutes: 20
@@ -190,31 +200,39 @@ telegram:
     - 987654321       # Family member's chat ID
 
 comfort:
-  summer_range: [75, 80]   # Cooling season target range (F)
-  winter_range: [68, 72]   # Heating season target range (F)
-  user_request_hours: 2    # Honor user requests this long, then re-evaluate
+  summer_range: [75, 80]       # Cooling season target range (F)
+  winter_range: [68, 72]       # Heating season target range (F)
+  user_request_hours: 2        # Honor user requests this long, then re-evaluate
+  sleep_cool_temp: 75          # Pre-cool to this before bed in summer
 
 schedule:
-  sleep_time: "22:00"
-  wake_time: "06:30"
-  sleep_temp: 68
-  wake_temp: 72
-  away_temp: 78
-  home_temp: 72
+  sleep_time: "23:00"
+  wake_time: "07:00"
+  precool_time: "21:30"        # Start pre-cooling before bed (optional, defaults to sleep_time - 1hr)
+
+presence:
+  phone_macs:
+    - "aa:bb:cc:dd:ee:ff"      # Your phone's Wi-Fi MAC
+    - "11:22:33:44:55:66"      # Family member's Wi-Fi MAC
+  consecutive_misses: 12       # Missed checks before vacation activates (12 × 5 min = 60 min)
+
+comfort_model:
+  corrections_path: "comfort_corrections.json"
+  deadband_f: 2.0              # Don't change if within this many degrees of target
 
 agent:
-  loop_interval_minutes: 20
+  loop_interval_minutes: 5
   db_path: "thermostat.db"
   log_level: "INFO"
 ```
 
-### Step 6: Install Dependencies
+### Step 7: Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Step 7: Run
+### Step 8: Run
 
 ```bash
 start.bat
@@ -232,25 +250,11 @@ python agent.py
 |---------|-------------|
 | `/status` | Show current temperature, humidity, mode, and last decision for all zones |
 | `/history` | Show the last 2 decisions |
+| `/vacation` | Show vacation mode status, presence info, and consecutive miss count |
+| `/vacation on` | Manually activate vacation mode |
+| `/vacation off` | Manually deactivate vacation mode and reset miss counter |
 | `/export` | Download the full climate log as a CSV file |
 | Any text message | Treated as a natural language instruction (e.g. "set upstairs to 78") |
-
-## How It Works
-
-Every 20 minutes (configurable), the agent:
-
-1. Reads indoor conditions from each Nest thermostat
-2. Fetches outdoor weather and forecast
-3. Checks for any recent Telegram messages from users
-4. Starts the local LLM server (llama-server)
-5. Sends all context to the AI, which returns a JSON decision per zone
-6. Validates the decision against safety guardrails
-7. Executes temperature changes via the Nest API
-8. Stops the LLM server to free GPU memory
-9. Logs everything to SQLite
-10. Sends you a Telegram message if any temperature was changed
-
-When you send a message via Telegram, the agent immediately runs an extra evaluation cycle with your request as priority context.
 
 ## Safety Guardrails
 
@@ -261,32 +265,32 @@ These are hard-coded and cannot be overridden by the AI:
 | Minimum temperature | 65F (60F in vacation mode) |
 | Maximum temperature | 80F (85F in vacation mode) |
 | Max changes per hour | 6 |
-| Manual override backoff | 120 minutes |
+| Manual override backoff | 30 minutes |
 
 - **User requests bypass rate limits** — if you ask for a change, it always goes through
-- **Manual override detection** — if someone changes the thermostat physically, the agent backs off for 2 hours
+- **Manual override detection** — if someone changes the thermostat physically, the agent backs off for 30 minutes
 - **LLM response validation** — malformed JSON or out-of-range temperatures are rejected
 
 ## File Structure
 
 ```
 AIThermostat/
-├── agent.py           # Main brain — evaluation loop, LLM calls, guardrails
+├── agent.py           # Main brain — evaluation loop, comfort model, guardrails
+├── comfort_model.py   # Two-layer predictive comfort model (ASHRAE baseline + learned corrections)
+├── nlp_parser.py      # NLP parser — regex fallback + LLM for natural language commands
 ├── telegram_bot.py    # Telegram bot — commands, message handling
 ├── nest_api.py        # Nest SDM API wrapper — read state, set temperature
 ├── weather.py         # Weather client — Open-Meteo primary, OWM fallback
 ├── database.py        # SQLite logging — climate, decisions, messages, errors
-├── location.py        # OwnTracks presence detection, vacation mode logic
+├── location.py        # ARP+ping presence detection, vacation mode logic
 ├── llm_server.py      # On-demand llama-server lifecycle manager
 ├── nest_setup.py      # One-time setup script for Nest API tokens
-├── test_qwen_4b.py    # LLM reliability test (18 scenarios)
-├── config.yaml        # All configuration
+├── config.yaml        # All configuration (gitignored — has secrets)
 ├── requirements.txt   # Python dependencies
 ├── start.bat          # Windows startup script
 ├── PRODUCT.md         # Product decisions, pivots, and learnings
 ├── ARCHITECTURE.md    # System architecture and component details
-├── tests/             # 95 unit tests (pytest)
-├── DesignDOC/         # Original design document
+├── tests/             # 157 unit tests (pytest)
 └── thermostat.db      # SQLite database (created on first run)
 ```
 
