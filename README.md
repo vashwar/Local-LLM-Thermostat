@@ -214,7 +214,7 @@ presence:
   phone_macs:
     - "aa:bb:cc:dd:ee:ff"      # Your phone's Wi-Fi MAC
     - "11:22:33:44:55:66"      # Family member's Wi-Fi MAC
-  consecutive_misses: 12       # Missed checks before vacation activates (12 × 5 min = 60 min)
+  consecutive_misses: 6        # Missed checks before vacation activates (6 × 5 min = 30 min)
 
 comfort_model:
   corrections_path: "comfort_corrections.json"

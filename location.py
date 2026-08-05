@@ -22,7 +22,7 @@ _enabled: bool = False
 _phone_macs: list = []
 _vacation_temp_min: int = 60
 _vacation_temp_max: int = 85
-_vacation_eval_interval_minutes: int = 60
+_vacation_eval_interval_minutes: int = 10
 
 _vacation_mode: bool = False
 _vacation_change_callback: Optional[Callable] = None
@@ -67,7 +67,7 @@ def init_location(config: dict):
     _vacation_temp_max = presence.get("vacation_temp_max", ot.get("vacation_temp_max", 85))
     _vacation_eval_interval_minutes = presence.get(
         "vacation_eval_interval_minutes",
-        ot.get("vacation_eval_interval_minutes", 60)
+        ot.get("vacation_eval_interval_minutes", 10)
     )
 
     _consecutive_misses = 0
@@ -100,6 +100,32 @@ def set_vacation_change_callback(fn: Callable):
     """Register an async callback for vacation mode transitions. fn(is_vacation: bool)."""
     global _vacation_change_callback
     _vacation_change_callback = fn
+
+
+def _broadcast_ping():
+    """Ping the subnet broadcast address to wake sleeping devices into the ARP table.
+    Discovers broadcast from the ARP table interface line (e.g. 192.168.1.x → 192.168.1.255)."""
+    try:
+        # Quick arp -a to find our subnet
+        result = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            if line.strip().startswith("Interface:"):
+                # "Interface: 192.168.1.67 --- 0x5"
+                parts = line.split()
+                if len(parts) >= 2:
+                    ip = parts[1]
+                    octets = ip.split(".")
+                    if len(octets) == 4:
+                        broadcast = f"{octets[0]}.{octets[1]}.{octets[2]}.255"
+                        subprocess.run(
+                            ["ping", "-n", "1", "-w", "500", broadcast],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        logger.debug("Broadcast ping sent to %s", broadcast)
+                        return
+        logger.debug("Could not determine broadcast address from ARP output")
+    except Exception as e:
+        logger.debug("Broadcast ping failed: %s", e)
 
 
 def _run_arp() -> str:
@@ -148,6 +174,9 @@ def check_arp_presence():
 
     if not _enabled:
         return
+
+    # Wake sleeping phones into the ARP table before scanning
+    _broadcast_ping()
 
     try:
         arp_output = _run_arp()

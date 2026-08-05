@@ -134,7 +134,7 @@ User requests from Telegram bypass rate limits and override backoff. The hierarc
 |---|---|---|---|
 | Target temperature | Comfort range | 85F (cool ceiling) | 60F (heat floor) |
 | Guardrail range | 65-80F | 60-85F | 60-85F |
-| Evaluation interval | 20 min | 60 min | 60 min |
+| Evaluation interval | 20 min | 10 min | 10 min |
 | LLM directive | Time-aware comfort logic | "Target 85F. Only cool if above 85F." | "Target 60F. Only heat if below 60F." |
 
 The mode-aware targets maximize energy savings: in summer, the AC only kicks in if the house exceeds 85F; in winter, the heater only fires if it drops below 60F. The longer interval reduces compute cycles. Telegram messages still work during vacation — users can override remotely if needed.
@@ -210,7 +210,7 @@ Covered above in Key Decisions. The trigger was a specific incident: OWM reporte
 
 **What happened:** I originally scoped out occupancy detection — "our schedule is predictable enough." That was true for daily patterns (sleep/wake/work). But when planning a week-long vacation, I realized the agent would keep the house at 75-80F the entire time, cooling an empty house in 100F heat. The system had no concept of "nobody is home for days."
 
-**What I did:** Instead of buying motion sensors or integrating with a smart home hub, I used OwnTracks — a free app that publishes phone GPS over MQTT. Both phones report to a local Mosquitto broker. When both phones are >30 miles from home, vacation mode sets mode-aware energy-saving targets (85F for cooling, 60F for heating) and slows evaluations to every 60 minutes.
+**What I did:** Instead of buying motion sensors or integrating with a smart home hub, I used OwnTracks — a free app that publishes phone GPS over MQTT. Both phones report to a local Mosquitto broker. When both phones are >30 miles from home, vacation mode sets mode-aware energy-saving targets (85F for cooling, 60F for heating) and slows evaluations to every 10 minutes.
 
 **The infrastructure was the hard part, not the code.** The location module was ~200 lines of Python. Getting it to work from anywhere required: Mosquitto as a Windows service, port forwarding on the AT&T gateway, and DuckDNS for dynamic IP resolution. Each step had its own friction (Mosquitto defaulting to localhost-only, ARM/x64 binary mismatch for password hashing, AT&T's NAT/Gaming UI). The code shipped in an hour. The infrastructure took a session of iterative debugging.
 

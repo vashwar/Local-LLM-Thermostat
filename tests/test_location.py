@@ -18,7 +18,7 @@ def reset_location_state():
     location._initialized = True
     location._vacation_temp_min = 60
     location._vacation_temp_max = 85
-    location._vacation_eval_interval_minutes = 60
+    location._vacation_eval_interval_minutes = 10
     location._consecutive_misses = 0
     location._required_misses = 2
     yield
